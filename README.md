@@ -13,3 +13,4 @@ After install, restart `pi` (or run `/reload`) and the extensions in this repo w
 ## Extensions
 
 - `subscription-fallback` (`/subswitch`): automatically switches between a ChatGPT subscription provider and an API-key provider when you hit usage/rate limits.
+- `title-status`: shows a small status icon (busy/ready/pending) in the terminal title.
