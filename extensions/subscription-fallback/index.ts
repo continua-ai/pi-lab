@@ -202,6 +202,10 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
   let activeProvider: string | undefined;
   let activeModelId: string | undefined;
 
+  // Approximate "API credits" usage: sum of assistant-message tokens while on the fallback provider.
+  // This is best-effort (depends on provider reporting usage) but is useful to eyeball spend.
+  let fallbackTokensUsed = 0;
+
   let lastCtx: any | undefined;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -215,6 +219,51 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
 
   function now(): number {
     return Date.now();
+  }
+
+  function formatTokens(n: number): string {
+    if (!Number.isFinite(n) || n <= 0) return "0";
+    if (n < 1000) return String(Math.floor(n));
+    if (n < 1_000_000) {
+      const v = (n / 1000).toFixed(1);
+      return v.endsWith(".0") ? `${v.slice(0, -2)}k` : `${v}k`;
+    }
+    const v = (n / 1_000_000).toFixed(1);
+    return v.endsWith(".0") ? `${v.slice(0, -2)}M` : `${v}M`;
+  }
+
+  function estimateTokensFromUsage(usage: any): number {
+    if (!usage) return 0;
+
+    // Prefer explicit total tokens if present.
+    const total = Number(usage.totalTokens);
+    if (Number.isFinite(total) && total > 0) return total;
+
+    const input = Number(usage.input);
+    const output = Number(usage.output);
+    const cacheRead = Number(usage.cacheRead);
+    const cacheWrite = Number(usage.cacheWrite);
+
+    return (Number.isFinite(input) ? input : 0) +
+      (Number.isFinite(output) ? output : 0) +
+      (Number.isFinite(cacheRead) ? cacheRead : 0) +
+      (Number.isFinite(cacheWrite) ? cacheWrite : 0);
+  }
+
+  function rebuildFallbackUsageFromSession(ctx: any): void {
+    fallbackTokensUsed = 0;
+    if (!cfg?.enabled) return;
+    const fallback = cfg.fallbackProvider;
+    if (!fallback) return;
+
+    const entries = typeof ctx.sessionManager?.getBranch === "function" ? ctx.sessionManager.getBranch() : [];
+    for (const entry of entries) {
+      if (entry?.type !== "message") continue;
+      const msg = entry.message;
+      if (!msg || msg.role !== "assistant") continue;
+      if (msg.provider !== fallback) continue;
+      fallbackTokensUsed += estimateTokensFromUsage(msg.usage);
+    }
   }
 
   function rememberActiveFromCtx(ctx: any): void {
@@ -320,9 +369,15 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
       msg += " " + ctx.ui.theme.fg("dim", managedModelId);
     }
 
-    if (retryPrimaryAfter && provider === fallback) {
+    // If a rate-limit/cooldown is in effect, show remaining minutes.
+    if (retryPrimaryAfter) {
       const mins = Math.max(0, Math.ceil((retryPrimaryAfter - now()) / 60000));
-      msg += " " + ctx.ui.theme.fg("dim", `(try sub again in ~${mins}m)`);
+      msg += " " + ctx.ui.theme.fg("dim", `(rate limit ~${mins}m)`);
+    }
+
+    // If we're using API credits (fallback provider), show token usage so far.
+    if (fallback && (provider === fallback || fallbackTokensUsed > 0)) {
+      msg += " " + ctx.ui.theme.fg("dim", `(credits ${formatTokens(fallbackTokensUsed)} tok)`);
     }
 
     ctx.ui.setStatus(EXT, msg);
@@ -384,6 +439,7 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     } else if (provider === cfg.fallbackProvider && retryPrimaryAfter) {
       schedulePrimaryRetry(ctx);
     }
+
 
     if (ctx.hasUI) {
       const label =
@@ -657,13 +713,21 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     if (!managedModelId) return;
 
     const msg: any = event.message;
+
+    // Track API-credit usage (best-effort): sum usage tokens for responses produced by the fallback provider.
+    if (msg?.provider === cfg.fallbackProvider && msg?.stopReason !== "error") {
+      fallbackTokensUsed += estimateTokensFromUsage(msg.usage);
+      updateStatus(ctx);
+    }
+
     const stopReason = msg?.stopReason;
     if (stopReason !== "error") return;
 
     const err = msg?.errorMessage ?? msg?.details?.error ?? msg?.error ?? "unknown error";
 
-    if (ctx.model?.provider !== cfg.primaryProvider) return;
-    if (ctx.model?.id !== managedModelId) return;
+    // Only auto-switch if the failing response came from the subscription provider.
+    if (msg?.provider !== cfg.primaryProvider) return;
+    if (msg?.model !== managedModelId) return;
 
     if (!isRateLimitError(err, cfg.rateLimitPatterns)) return;
 
@@ -695,10 +759,29 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     }
   });
 
+  pi.on("session_switch", async (_event, ctx) => {
+    // When resuming or switching sessions, rebuild token usage from the new session's history.
+    cfg = loadConfig(ctx.cwd);
+    managedModelId = resolveManagedModelId(ctx);
+
+    // Reset active provider/model view; will be rehydrated from ctx/model_select.
+    activeProvider = undefined;
+    activeModelId = undefined;
+    rememberActiveFromCtx(ctx);
+
+    rebuildFallbackUsageFromSession(ctx);
+
+    clearRetryTimer();
+    retryPrimaryAfter = 0;
+    updateStatus(ctx);
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     cfg = loadConfig(ctx.cwd);
     managedModelId = resolveManagedModelId(ctx);
     rememberActiveFromCtx(ctx);
+
+    rebuildFallbackUsageFromSession(ctx);
 
     clearRetryTimer();
     if (retryPrimaryAfter) {

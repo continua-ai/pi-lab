@@ -77,6 +77,10 @@ Project-local values override global.
 
 ## Notes / limitations
 
+- The footer status line shows:
+  - whether you’re on subscription (`sub`) or API credits (`api`),
+  - remaining time until the subscription rate-limit cooldown ends (when applicable), and
+  - best-effort total tokens used while on API credits.
 - Switching back to subscription happens when pi is idle; the extension avoids changing models mid-stream.
 - If switching back fails (credentials/provider issues), the extension backs off for ~5 minutes and retries.
 - The extension only manages switching when the chosen model id exists in both providers.
