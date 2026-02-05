@@ -24,7 +24,7 @@ import type { MarkdownTheme } from "@mariozechner/pi-tui";
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 
 const EXTENSION_KEY = "session-context";
-const STATUS_KEY = "session-context";
+const WIDGET_KEY = "session-context";
 const SETTINGS_FILE_NAME = "settings.json";
 const DEFAULT_CONFIG_DIR = ".pi";
 const EXTENSIONS_CONFIG_KEY = "extensionsConfig";
@@ -126,7 +126,7 @@ function formatLocalTimestamp(date: Date): string {
     .trim();
 }
 
-function buildStatusLine(line: string, updatedAt: Date): string {
+function buildWidgetLine(line: string, updatedAt: Date): string {
   const updatedLabel = formatLocalTimestamp(updatedAt);
   const summary = truncateText(normalizeLine(line), LINE_MAX_CHARS);
   return `ctx: ${summary} · ${updatedLabel}`;
@@ -224,7 +224,10 @@ async function resolveSummaryModel(
 ): Promise<ModelResolution> {
   const available = ctx.modelRegistry.getAvailable();
   if (available.length === 0) {
-    return { reason: "Session context unavailable (no authenticated models)" };
+    return {
+      reason:
+        "Session context unavailable (no authenticated models). Run /login or set an API key.",
+    };
   }
 
   if (overrideModel) {
@@ -245,14 +248,14 @@ async function resolveSummaryModel(
 
     if (!model) {
       return {
-        reason: `Session context unavailable (model override not found: ${overrideModel})`,
+        reason: `Session context unavailable (model override not found: ${overrideModel}). Check extensionsConfig.sessionContext.model.`,
       };
     }
 
     const apiKey = await ctx.modelRegistry.getApiKey(model);
     if (!apiKey) {
       return {
-        reason: `Session context unavailable (no API key for ${model.provider})`,
+        reason: `Session context unavailable (no API key for ${model.provider}). Run /login or set an API key.`,
       };
     }
 
@@ -292,7 +295,10 @@ async function resolveSummaryModel(
     }
   }
 
-  return { reason: "Session context unavailable (no API key available)" };
+  return {
+    reason:
+      "Session context unavailable (no API key available). Run /login or set an API key.",
+  };
 }
 
 function extractMessageStats(entries: SessionEntry[]): MessageStats {
@@ -659,7 +665,7 @@ function storeSummary(
   };
 
   pi.appendEntry(EXTENSION_KEY, stored);
-  applySummaryStatus(ctx, stored);
+  applySummaryWidget(ctx, stored);
 }
 
 function loadStoredSummary(ctx: ExtensionContext): StoredSessionContext | null {
@@ -697,22 +703,30 @@ function loadStoredSummary(ctx: ExtensionContext): StoredSessionContext | null {
   return null;
 }
 
-function applySummaryStatus(
+function setWidgetLine(ctx: ExtensionContext, line: string | undefined): void {
+  if (!ctx.hasUI) return;
+  if (!line) {
+    ctx.ui.setWidget(WIDGET_KEY, undefined);
+    return;
+  }
+  ctx.ui.setWidget(WIDGET_KEY, [line], { placement: "belowEditor" });
+}
+
+function applySummaryWidget(
   ctx: ExtensionContext,
   stored: StoredSessionContext | null,
 ): void {
   currentSummary = stored;
-  if (!ctx.hasUI) return;
   if (!stored) {
-    ctx.ui.setStatus(STATUS_KEY, undefined);
+    setWidgetLine(ctx, undefined);
     return;
   }
   const updatedAt = new Date(stored.updatedAt);
-  ctx.ui.setStatus(STATUS_KEY, buildStatusLine(stored.line, updatedAt));
+  setWidgetLine(ctx, buildWidgetLine(stored.line, updatedAt));
 }
 
 function applyStoredSummary(ctx: ExtensionContext): void {
-  applySummaryStatus(ctx, loadStoredSummary(ctx));
+  applySummaryWidget(ctx, loadStoredSummary(ctx));
 }
 
 class SessionContextModal extends Container {
@@ -818,9 +832,7 @@ async function runSummaryFlow(
 
   const previousSummary = currentSummary;
   inFlight = true;
-  if (ctx.hasUI) {
-    ctx.ui.setStatus(STATUS_KEY, "ctx: updating…");
-  }
+  setWidgetLine(ctx, "ctx: updating…");
 
   try {
     const config = await loadSessionContextConfig(ctx);
@@ -829,7 +841,7 @@ async function runSummaryFlow(
       if (ctx.hasUI && resolution.reason) {
         ctx.ui.notify(resolution.reason, "warning");
       }
-      applySummaryStatus(ctx, previousSummary);
+      applySummaryWidget(ctx, previousSummary);
       return;
     }
 
@@ -897,7 +909,7 @@ async function runSummaryFlow(
       if (ctx.hasUI) {
         ctx.ui.notify("Session context update cancelled", "warning");
       }
-      applySummaryStatus(ctx, previousSummary);
+      applySummaryWidget(ctx, previousSummary);
       return;
     }
 
@@ -908,7 +920,7 @@ async function runSummaryFlow(
           "error",
         );
       }
-      applySummaryStatus(ctx, previousSummary);
+      applySummaryWidget(ctx, previousSummary);
       return;
     }
 
@@ -920,7 +932,7 @@ async function runSummaryFlow(
     if (ctx.hasUI) {
       ctx.ui.notify(`Session context failed: ${message}`, "error");
     }
-    applySummaryStatus(ctx, previousSummary);
+    applySummaryWidget(ctx, previousSummary);
   } finally {
     inFlight = false;
   }
@@ -943,8 +955,6 @@ export default function sessionContext(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
-    if (ctx.hasUI) {
-      ctx.ui.setStatus(STATUS_KEY, undefined);
-    }
+    setWidgetLine(ctx, undefined);
   });
 }
