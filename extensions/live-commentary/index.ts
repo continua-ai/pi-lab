@@ -1,4 +1,6 @@
 import { open, readFile, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type {
   ExtensionAPI,
@@ -30,7 +32,10 @@ const OUTPUT_FILE_HEAD_BYTES = 6_000;
 const OUTPUT_FILE_TAIL_BYTES = 6_000;
 const SUMMARY_MAX_CHARS = 200;
 const SILENCE_CANCEL_MS = 30_000;
-const MODEL_ENV = "PI_LIVE_COMMENTARY_MODEL";
+const SETTINGS_FILE_NAME = "settings.json";
+const DEFAULT_CONFIG_DIR = ".pi";
+const EXTENSIONS_CONFIG_KEY = "extensionsConfig";
+const LIVE_COMMENTARY_CONFIG_KEY = "liveCommentary";
 const CHEAP_MODEL_HINTS = ["mini", "haiku", "flash", "small", "lite"];
 
 type CommentaryAction = {
@@ -58,6 +63,16 @@ type ContextSnapshot = {
   lines: string[];
 };
 
+type LiveCommentaryConfig = {
+  model?: string;
+};
+
+type ModelResolution = {
+  model?: Model<Api>;
+  apiKey?: string;
+  reason?: string;
+};
+
 type ToolRun = {
   toolCallId: string;
   toolName: string;
@@ -69,6 +84,7 @@ type ToolRun = {
   lastOutputAt?: number;
   contextPrompt?: string;
   contextLines: string[];
+  settings: LiveCommentaryConfig;
   summary?: CommentaryResult;
   startTimer?: NodeJS.Timeout;
   nextTimer?: NodeJS.Timeout;
@@ -97,6 +113,52 @@ function truncateText(text: string, max = DISPLAY_TRUNCATE): string {
 
 function normalizeLine(text: string): string {
   return text.replace(/\s+/g, " ").trim();
+}
+
+function expandHomeDir(pathValue: string): string {
+  if (pathValue === "~") return homedir();
+  if (pathValue.startsWith("~/")) return join(homedir(), pathValue.slice(2));
+  return pathValue;
+}
+
+function getAgentSettingsPath(): string {
+  const envDir = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = envDir ? expandHomeDir(envDir) : join(homedir(), DEFAULT_CONFIG_DIR, "agent");
+  return join(agentDir, SETTINGS_FILE_NAME);
+}
+
+function getProjectSettingsPath(cwd: string): string {
+  const baseDir = cwd || process.cwd();
+  return join(baseDir, DEFAULT_CONFIG_DIR, SETTINGS_FILE_NAME);
+}
+
+async function loadSettingsFile(pathValue: string): Promise<Record<string, unknown> | null> {
+  try {
+    const content = await readFile(pathValue, "utf8");
+    return JSON.parse(content) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function extractLiveCommentaryConfig(settings: Record<string, unknown> | null): LiveCommentaryConfig {
+  if (!settings) return {};
+  const extensionsConfig = settings[EXTENSIONS_CONFIG_KEY];
+  if (!isRecord(extensionsConfig)) return {};
+  const liveCommentary = extensionsConfig[LIVE_COMMENTARY_CONFIG_KEY];
+  if (!isRecord(liveCommentary)) return {};
+  const model = typeof liveCommentary.model === "string" ? liveCommentary.model : undefined;
+  return model ? { model } : {};
+}
+
+async function loadLiveCommentaryConfig(ctx: ExtensionContext): Promise<LiveCommentaryConfig> {
+  const [globalSettings, projectSettings] = await Promise.all([
+    loadSettingsFile(getAgentSettingsPath()),
+    loadSettingsFile(getProjectSettingsPath(ctx.cwd)),
+  ]);
+  const globalConfig = extractLiveCommentaryConfig(globalSettings);
+  const projectConfig = extractLiveCommentaryConfig(projectSettings);
+  return { ...globalConfig, ...projectConfig };
 }
 
 function formatBytes(bytes: number): string {
@@ -452,36 +514,73 @@ function findPreferredModel(models: Array<Model<Api>>, hints: string[]): Model<A
   return undefined;
 }
 
-function resolveCommentaryModel(ctx: ExtensionContext): Model<Api> | undefined {
+async function resolveCommentaryModel(
+  ctx: ExtensionContext,
+  overrideModel: string | undefined,
+): Promise<ModelResolution> {
   const available = ctx.modelRegistry.getAvailable();
-  if (available.length === 0) return undefined;
+  if (available.length === 0) {
+    return { reason: "Live commentary unavailable (no authenticated providers)" };
+  }
 
-  const override = process.env[MODEL_ENV];
-  if (override) {
-    const parsed = parseModelSpecifier(override, ctx.model?.provider);
+  if (overrideModel) {
+    const parsed = parseModelSpecifier(overrideModel, ctx.model?.provider);
+    let model: Model<Api> | undefined;
+
     if (parsed.provider) {
-      const model = ctx.modelRegistry.find(parsed.provider, parsed.id);
-      if (model) return model;
+      model = ctx.modelRegistry.find(parsed.provider, parsed.id);
     }
-    const byId = available.find((model) => model.id === parsed.id);
-    if (byId) return byId;
+
+    if (!model) {
+      const candidates = available.filter((item) => item.id === parsed.id);
+      if (candidates.length > 0 && ctx.model?.provider) {
+        model = candidates.find((item) => item.provider === ctx.model?.provider);
+      }
+      model ??= candidates[0];
+    }
+
+    if (!model) {
+      return { reason: `Live commentary unavailable (model override not found: ${overrideModel})` };
+    }
+
+    const apiKey = await ctx.modelRegistry.getApiKey(model);
+    if (!apiKey) {
+      return { reason: `Live commentary unavailable (no API key for ${model.provider})` };
+    }
+
+    return { model, apiKey };
   }
 
-  const provider = ctx.model?.provider;
-  const providerModels = provider ? available.filter((model) => model.provider === provider) : [];
-  const preferred = findPreferredModel(providerModels, CHEAP_MODEL_HINTS);
-  if (preferred) return preferred;
+  const currentProvider = ctx.model?.provider;
+  const candidatePools: Array<Array<Model<Api>>> = [];
 
-  const globalPreferred = findPreferredModel(available, CHEAP_MODEL_HINTS);
-  if (globalPreferred) return globalPreferred;
-
-  const current = ctx.model;
-  if (current) {
-    const availableCurrent = available.find((model) => model.provider === current.provider && model.id === current.id);
-    if (availableCurrent) return availableCurrent;
+  if (currentProvider) {
+    const providerModels = available.filter((model) => model.provider === currentProvider);
+    if (providerModels.length > 0) {
+      candidatePools.push(providerModels);
+    }
   }
 
-  return available[0];
+  candidatePools.push(available);
+
+  const tried = new Set<string>();
+  for (const pool of candidatePools) {
+    const preferred = findPreferredModel(pool, CHEAP_MODEL_HINTS);
+    const ordered = preferred ? [preferred, ...pool.filter((model) => model !== preferred)] : pool;
+
+    for (const model of ordered) {
+      const key = `${model.provider}/${model.id}`;
+      if (tried.has(key)) continue;
+      tried.add(key);
+
+      const apiKey = await ctx.modelRegistry.getApiKey(model);
+      if (apiKey) {
+        return { model, apiKey };
+      }
+    }
+  }
+
+  return { reason: "Live commentary unavailable (no API key available)" };
 }
 
 function extractJsonBlock(text: string): string | null {
@@ -526,18 +625,13 @@ function parseCommentaryResponse(text: string): CommentaryResult {
 
 async function ensureModel(ctx: ExtensionContext, run: ToolRun): Promise<boolean> {
   if (run.model && run.apiKey) return true;
-  const model = resolveCommentaryModel(ctx);
-  if (!model) {
-    run.disabledReason = "Live commentary unavailable (no available model)";
+  const resolution = await resolveCommentaryModel(ctx, run.settings.model);
+  if (!resolution.model || !resolution.apiKey) {
+    run.disabledReason = resolution.reason ?? "Live commentary unavailable";
     return false;
   }
-  const apiKey = await ctx.modelRegistry.getApiKey(model);
-  if (!apiKey) {
-    run.disabledReason = `Live commentary unavailable (no API key for ${model.provider})`;
-    return false;
-  }
-  run.model = model;
-  run.apiKey = apiKey;
+  run.model = resolution.model;
+  run.apiKey = resolution.apiKey;
   return true;
 }
 
@@ -729,13 +823,16 @@ function scheduleCommentary(ctx: ExtensionContext, run: ToolRun): void {
   }, START_DELAY_MS);
 }
 
-function handleToolStart(event: ToolExecutionStartEvent, ctx: ExtensionContext): void {
+async function handleToolStart(event: ToolExecutionStartEvent, ctx: ExtensionContext): Promise<void> {
   if (!ctx.hasUI) return;
   if (event.toolName !== "bash") return;
 
   clearRun(ctx);
 
-  const contextSnapshot = buildContextSnapshot(ctx);
+  const [contextSnapshot, settings] = await Promise.all([
+    Promise.resolve(buildContextSnapshot(ctx)),
+    loadLiveCommentaryConfig(ctx),
+  ]);
 
   activeRun = {
     toolCallId: event.toolCallId,
@@ -746,6 +843,7 @@ function handleToolStart(event: ToolExecutionStartEvent, ctx: ExtensionContext):
     outputHistory: "",
     contextPrompt: contextSnapshot.prompt,
     contextLines: contextSnapshot.lines,
+    settings,
     inFlight: false,
     active: true,
   };
@@ -782,7 +880,7 @@ function handleToolEnd(event: ToolExecutionEndEvent, ctx: ExtensionContext): voi
 
 export default function liveCommentary(pi: ExtensionAPI): void {
   pi.on("tool_execution_start", (event, ctx) => {
-    handleToolStart(event, ctx);
+    void handleToolStart(event, ctx);
   });
 
   pi.on("tool_execution_update", (event) => {

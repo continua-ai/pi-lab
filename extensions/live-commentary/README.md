@@ -14,17 +14,22 @@ It auto-starts after ~10 seconds and refreshes about every 10 seconds until the 
 
 ## Configuration
 
-Use a cheaper model via `PI_LIVE_COMMENTARY_MODEL`:
+Override the commentary model in `settings.json` (global or project):
 
-```bash
-# Same provider as current model
-export PI_LIVE_COMMENTARY_MODEL=gpt-4o-mini
-
-# Explicit provider
-export PI_LIVE_COMMENTARY_MODEL=anthropic/claude-3-5-haiku-20241022
+```json
+{
+  "extensionsConfig": {
+    "liveCommentary": {
+      "model": "openai/gpt-4o-mini"
+    }
+  }
+}
 ```
 
-If unset, the extension picks a "mini/haiku/flash" model from available providers.
+- Global: `~/.pi/agent/settings.json`
+- Project: `./.pi/settings.json`
+
+If unset, the extension picks a "mini/haiku/flash" model from providers with auth/login available.
 
 ## Install
 
