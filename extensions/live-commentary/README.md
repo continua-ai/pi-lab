@@ -7,7 +7,9 @@ It auto-starts after ~10 seconds and refreshes about every 10 seconds until the 
 
 - Watches `bash` tool executions.
 - After 10s of runtime, calls a cheaper model to summarize progress and suggest next steps.
-- Renders an inline widget above the editor with elapsed time, last output line, and suggestions.
+- Includes the triggering user prompt and recent session context in the analysis.
+- Reads full output from the tool's `fullOutputPath` when output truncates; otherwise accumulates streamed output.
+- Renders an inline widget above the editor with elapsed time, last output line, and suggestions (including cancel when output stalls).
 - Stops automatically when the tool completes or is aborted.
 
 ## Configuration
