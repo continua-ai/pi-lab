@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -12,10 +13,7 @@ import {
   DynamicBorder,
   appKeyHint,
   buildSessionContext,
-  computeFileLists,
   convertToLlm,
-  createFileOps,
-  extractFileOpsFromMessage,
   getMarkdownTheme,
   serializeConversation,
 } from "@mariozechner/pi-coding-agent";
@@ -332,6 +330,48 @@ function extractRecentCommands(entries: SessionEntry[]): string[] {
     if (commands.length >= MAX_RECENT_COMMANDS) break;
   }
   return commands.reverse();
+}
+
+type FileOps = {
+  read: Set<string>;
+  modified: Set<string>;
+};
+
+function createFileOps(): FileOps {
+  return { read: new Set(), modified: new Set() };
+}
+
+function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOps): void {
+  if (message.role !== "assistant") return;
+  if (!Array.isArray(message.content)) return;
+
+  for (const block of message.content) {
+    if (!isRecord(block) || block.type !== "toolCall") continue;
+    const name = typeof block.name === "string" ? block.name : undefined;
+    if (!name) continue;
+    const args = isRecord(block.arguments) ? block.arguments : undefined;
+    if (!args) continue;
+    const pathValue = args.path;
+    if (typeof pathValue !== "string") continue;
+
+    if (name === "read") {
+      fileOps.read.add(pathValue);
+    } else if (name === "write" || name === "edit") {
+      fileOps.modified.add(pathValue);
+    }
+  }
+}
+
+function computeFileLists(fileOps: FileOps): {
+  readFiles: string[];
+  modifiedFiles: string[];
+} {
+  const modified = new Set(fileOps.modified);
+  const readOnly = [...fileOps.read]
+    .filter((pathValue) => !modified.has(pathValue))
+    .sort();
+  const modifiedFiles = [...modified].sort();
+  return { readFiles: readOnly, modifiedFiles };
 }
 
 function extractFileOps(entries: SessionEntry[]): {
