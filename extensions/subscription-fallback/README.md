@@ -103,6 +103,7 @@ Notes:
 
 - The extension switches the **process** `OPENAI_API_KEY` at runtime (it does not print keys).
 - Rotation is only attempted when `fallbackAccounts.length > 1`.
+- The extension does **not** auto-resend on fallback-key rotation (pi core may already be auto-retrying failed calls).
 - When `fallbackAccounts` are configured, the extension also clears `OPENAI_ORG_ID` / `OPENAI_PROJECT_ID` unless you provide `openaiOrgIdEnv` / `openaiProjectIdEnv` per account.
 
 ## Notes / limitations

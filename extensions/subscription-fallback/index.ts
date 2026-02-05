@@ -991,14 +991,8 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
 
       updateStatus(ctx);
 
-      if (cfg.autoRetry && lastPrompt && lastPrompt.source !== "extension") {
-        const content = buildUserMessageContent(lastPrompt.text, lastPrompt.images);
-        if (typeof ctx.isIdle === "function" && ctx.isIdle()) {
-          pi.sendUserMessage(content);
-        } else {
-          pi.sendUserMessage(content, { deliverAs: "followUp" });
-        }
-      }
+      // NOTE: We intentionally do not auto-resend the prompt here.
+      // pi itself may have auto-retry enabled; resending here would double-send.
     }
   });
 
