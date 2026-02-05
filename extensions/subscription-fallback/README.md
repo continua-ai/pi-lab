@@ -7,6 +7,8 @@ Automatically switches between:
 
 …when the subscription provider hits rate limits / usage limits.
 
+If you have **multiple ChatGPT OAuth accounts**, you can configure multiple primary providers (aliases) and the extension will try all of them before falling back to API credits.
+
 ## Install
 
 Option A (recommended): install as a pi package:
@@ -37,8 +39,8 @@ All control is via the `/subswitch` command.
 - `/subswitch on` / `/subswitch off`
   - Enable/disable the extension.
 
-- `/subswitch primary`
-  - Force switch to subscription provider (default: `openai-codex`).
+- `/subswitch primary [providerId]`
+  - Force switch to a subscription provider (defaults to the first of `primaryProviders`, or `openai-codex`).
 
 - `/subswitch fallback`
   - Force switch to API-key provider (default: `openai`).
@@ -74,6 +76,36 @@ Project-local values override global.
   ]
 }
 ```
+
+### Multiple ChatGPT OAuth accounts (subscription aliases)
+
+pi stores OAuth credentials **per provider id**. This extension registers two common alias providers:
+
+- `openai-codex-personal`
+- `openai-codex-work`
+
+Log into both:
+
+- `/login openai-codex-personal`
+- `/login openai-codex-work`
+
+Then configure `primaryProviders` so `/subswitch` can rotate between them:
+
+```json
+{
+  "primaryProviders": ["openai-codex-personal", "openai-codex-work"],
+  "fallbackProvider": "openai",
+  "cooldownMinutes": 180
+}
+```
+
+Behavior:
+
+- If the active subscription account gets rate-limited, `/subswitch` will try the other subscription account first.
+- Only if **all** subscription accounts are cooling down will it switch to API credits.
+- When cooling down, it periodically tries to switch back to **any** available subscription account.
+
+Note: adding new alias provider ids requires restarting pi (provider registration happens at extension load time).
 
 ### Multiple OpenAI accounts (API key rotation)
 
@@ -111,3 +143,4 @@ Notes:
 - Switching back to subscription happens when pi is idle; the extension avoids changing models mid-stream.
 - If switching back fails (credentials/provider issues), the extension backs off for ~5 minutes and retries.
 - The extension only manages switching when the chosen model id exists in both providers.
+- "Context window exceeded" errors do **not** trigger fallback switching (they are not quota/rate-limit).

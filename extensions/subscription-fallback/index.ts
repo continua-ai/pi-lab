@@ -13,6 +13,8 @@ import { join } from "node:path";
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
+import { getModels, loginOpenAICodex, refreshOpenAICodexToken } from "@mariozechner/pi-ai";
+
 type InputSource = "interactive" | "rpc" | "extension";
 
 interface OpenAIAccount {
@@ -41,6 +43,14 @@ interface Config {
 
   /** Subscription provider (via /login). Default: openai-codex */
   primaryProvider?: string;
+
+  /**
+   * Optional: multiple subscription providers (OAuth) to rotate through before using API credits.
+   * If set, this overrides primaryProvider.
+   *
+   * Example: ["openai-codex-personal", "openai-codex-work"]
+   */
+  primaryProviders?: string[];
 
   /** API-key provider (via OPENAI_API_KEY). Default: openai */
   fallbackProvider?: string;
@@ -112,6 +122,12 @@ function loadConfig(cwd: string): Config {
   // Normalize
   merged.enabled = merged.enabled ?? true;
   merged.primaryProvider = merged.primaryProvider || "openai-codex";
+
+  const primaryProviders = Array.isArray(merged.primaryProviders)
+    ? merged.primaryProviders.map((p) => String(p).trim()).filter(Boolean)
+    : [];
+  merged.primaryProviders = primaryProviders.length > 0 ? primaryProviders : undefined;
+
   merged.fallbackProvider = merged.fallbackProvider || "openai";
   merged.cooldownMinutes = merged.cooldownMinutes ?? 180;
   merged.autoRetry = merged.autoRetry ?? true;
@@ -122,7 +138,31 @@ function loadConfig(cwd: string): Config {
   return merged;
 }
 
+function isContextWindowExceededError(err: unknown): boolean {
+  const s = String(err ?? "");
+  const l = s.toLowerCase();
+
+  const patterns = [
+    "context window",
+    "context length",
+    "maximum context",
+    "maximum context length",
+    "max context",
+    "context_length_exceeded",
+    "context length exceeded",
+    "this model's maximum context length",
+    "prompt is too long",
+    "input is too long",
+    "too many tokens",
+  ];
+
+  return patterns.some((p) => p && l.includes(p));
+}
+
 function isRateLimitError(err: unknown, extraPatterns: string[] = []): boolean {
+  // Avoid treating "context window exceeded" and similar as quota/rate-limit.
+  if (isContextWindowExceededError(err)) return false;
+
   const s = String(err ?? "");
   const l = s.toLowerCase();
 
@@ -135,7 +175,10 @@ function isRateLimitError(err: unknown, extraPatterns: string[] = []): boolean {
     "please try again",
     "usage limit",
     "usage_limit",
-    "exceeded",
+    "insufficient_quota",
+    "quota exceeded",
+    "exceeded your current quota",
+    "billing hard limit",
     "capacity",
     ...extraPatterns.map((p) => p.toLowerCase()),
   ];
@@ -223,8 +266,17 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
   let cfg: Config | undefined;
   let managedModelId: string | undefined;
 
-  // When we last hit the subscription limit; used to decide when to try primary again.
+  // Subscription providers (OAuth) we consider "primary".
+  let primaryProviders: string[] = [];
+  let primaryProviderSet = new Set<string>();
+  let primaryProviderRetryAfter = new Map<string, number>();
+
+  // When to next attempt switching from fallback -> any primary provider.
+  // (Computed from primaryProviderRetryAfter; 0 means no retry scheduled.)
   let retryPrimaryAfter = 0;
+
+  // NOTE: pi's ExtensionAPI.registerProvider only takes effect during extension loading.
+  let codexAliasesRegistered = false;
 
   // Optional: rotate among multiple OpenAI API keys while using the fallback provider.
   let fallbackAccounts: OpenAIAccount[] = [];
@@ -275,8 +327,176 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     return path;
   }
 
+  function normalizePrimaryProviders(nextCfg: Config): string[] {
+    const list = Array.isArray(nextCfg.primaryProviders)
+      ? nextCfg.primaryProviders.map((p) => String(p).trim()).filter(Boolean)
+      : [];
+    if (list.length > 0) return list;
+
+    const single = String(nextCfg.primaryProvider ?? "openai-codex").trim();
+    return single ? [single] : ["openai-codex"];
+  }
+
+  function formatPrimaryProviderLabel(provider: string): string {
+    if (provider.startsWith("openai-codex-")) {
+      const suffix = provider.slice("openai-codex-".length);
+      return suffix || provider;
+    }
+    return provider;
+  }
+
+  function computeNextPrimaryRetryAfterMs(): number {
+    let min = 0;
+    for (const p of primaryProviders) {
+      const until = primaryProviderRetryAfter.get(p) ?? 0;
+      if (!until) continue;
+      if (until <= now()) continue;
+      min = min ? Math.min(min, until) : until;
+    }
+    return min;
+  }
+
+  function recomputeRetryPrimaryAfter(): void {
+    retryPrimaryAfter = computeNextPrimaryRetryAfterMs();
+  }
+
+  function isPrimaryProvider(provider: string | undefined): boolean {
+    return Boolean(provider && primaryProviderSet.has(provider));
+  }
+
+  function setPrimaryCooldown(provider: string, untilMs: number): void {
+    if (!isPrimaryProvider(provider)) return;
+    primaryProviderRetryAfter.set(provider, untilMs);
+    recomputeRetryPrimaryAfter();
+  }
+
+  function clearPrimaryCooldown(provider: string): void {
+    if (!isPrimaryProvider(provider)) return;
+    primaryProviderRetryAfter.set(provider, 0);
+    recomputeRetryPrimaryAfter();
+  }
+
+  function isPrimaryCoolingDown(provider: string): boolean {
+    if (!isPrimaryProvider(provider)) return false;
+    const until = primaryProviderRetryAfter.get(provider) ?? 0;
+    return Boolean(until && now() < until);
+  }
+
+  function selectBestPrimaryProvider(): string | undefined {
+    for (const p of primaryProviders) {
+      if (!isPrimaryCoolingDown(p)) return p;
+    }
+    return undefined;
+  }
+
+  function selectNextPrimaryProvider(currentProvider: string): string | undefined {
+    if (primaryProviders.length === 0) return undefined;
+
+    const start = Math.max(0, primaryProviders.indexOf(currentProvider));
+    for (let offset = 1; offset <= primaryProviders.length; offset++) {
+      const idx = (start + offset) % primaryProviders.length;
+      const p = primaryProviders[idx];
+      if (!p || p === currentProvider) continue;
+      if (!isPrimaryCoolingDown(p)) return p;
+    }
+
+    return undefined;
+  }
+
+  function registerCodexAliasProvider(providerId: string): void {
+    // Only handle OpenAI Codex aliases of the form "openai-codex-<name>".
+    if (providerId === "openai-codex") return;
+    if (!providerId.startsWith("openai-codex-")) return;
+
+    const codexModels = getModels("openai-codex");
+    if (!codexModels || codexModels.length === 0) return;
+
+    const label = formatPrimaryProviderLabel(providerId);
+
+    pi.registerProvider(providerId, {
+      baseUrl: codexModels[0]?.baseUrl,
+      models: codexModels.map((m) => ({
+        id: m.id,
+        name: m.name,
+        api: m.api,
+        reasoning: m.reasoning,
+        input: m.input,
+        cost: m.cost,
+        contextWindow: m.contextWindow,
+        maxTokens: m.maxTokens,
+        headers: m.headers,
+        compat: (m as any).compat,
+      })),
+      oauth: {
+        name: `ChatGPT Plus/Pro (Codex Subscription) (${label})`,
+        async login(callbacks: any) {
+          return loginOpenAICodex({
+            onAuth: callbacks.onAuth,
+            onPrompt: callbacks.onPrompt,
+            onProgress: callbacks.onProgress,
+            onManualCodeInput: callbacks.onManualCodeInput,
+            // Make it easier to distinguish multiple logins server-side.
+            originator: providerId,
+          });
+        },
+        async refreshToken(credentials: any) {
+          return refreshOpenAICodexToken(String(credentials.refresh));
+        },
+        getApiKey(credentials: any) {
+          return String(credentials.access);
+        },
+      },
+    });
+  }
+
+  function registerCodexAliasProvidersFromCfg(nextCfg: Config): void {
+    for (const p of normalizePrimaryProviders(nextCfg)) {
+      registerCodexAliasProvider(p);
+    }
+  }
+
+  function registerCodexAliasesAtStartup(): void {
+    if (codexAliasesRegistered) return;
+    codexAliasesRegistered = true;
+
+    // Register any aliases declared in config (so `/login <alias>` works).
+    // NOTE: changing primaryProviders requires a pi restart for new aliases to appear.
+    const bootCfg = loadConfig(process.cwd());
+
+    const ids = new Set<string>();
+
+    // Aliases from config
+    for (const p of normalizePrimaryProviders(bootCfg)) {
+      ids.add(p);
+    }
+
+    // Two standard aliases for the common "2 accounts" case.
+    ids.add("openai-codex-personal");
+    ids.add("openai-codex-work");
+
+    for (const id of ids) {
+      registerCodexAliasProvider(id);
+    }
+  }
+
+  // IMPORTANT: must run during extension loading so provider registrations are applied.
+  registerCodexAliasesAtStartup();
+
   function setCfg(nextCfg: Config): void {
     cfg = nextCfg;
+
+    primaryProviders = normalizePrimaryProviders(nextCfg);
+    primaryProviderSet = new Set(primaryProviders);
+
+    const prev = primaryProviderRetryAfter;
+    primaryProviderRetryAfter = new Map<string, number>();
+    for (const p of primaryProviders) {
+      primaryProviderRetryAfter.set(p, prev.get(p) ?? 0);
+    }
+    recomputeRetryPrimaryAfter();
+
+    // NOTE: OAuth provider alias registration must happen during extension loading.
+    // We register aliases once at startup (see registerCodexAliasesAtStartup()).
 
     // Only support multi-account rotation for the built-in "openai" provider.
     fallbackAccounts = nextCfg.fallbackProvider === "openai" ? (nextCfg.fallbackAccounts ?? []) : [];
@@ -482,19 +702,37 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
       return;
     }
 
-    if (ctx.hasUI) {
-      ctx.ui.notify(`[${EXT}] Cooldown expired; switching back to subscription…`, "info");
+    const targetPrimary = selectBestPrimaryProvider();
+    if (!targetPrimary) {
+      // No primary is currently eligible; schedule the next retry.
+      recomputeRetryPrimaryAfter();
+      schedulePrimaryRetry(ctx);
+      return;
     }
 
-    const switched = await switchToProvider(ctx, cfg.primaryProvider!, reason);
+    if (ctx.hasUI) {
+      ctx.ui.notify(
+        `[${EXT}] Cooldown expired; switching back to subscription (${formatPrimaryProviderLabel(targetPrimary)})…`,
+        "info",
+      );
+    }
+
+    const switched = await switchToProvider(ctx, targetPrimary, reason);
     if (switched) {
+      clearPrimaryCooldown(targetPrimary);
       retryPrimaryAfter = 0;
       clearRetryTimer();
     } else {
+      // Avoid thrashing if the switch keeps failing (missing creds, etc.)
+      setPrimaryCooldown(targetPrimary, now() + 5 * 60_000);
+
       if (ctx.hasUI) {
-        ctx.ui.notify(`[${EXT}] Failed to switch back to subscription; will retry in ~5m`, "warning");
+        ctx.ui.notify(
+          `[${EXT}] Failed to switch back to subscription; will retry in ~5m`,
+          "warning",
+        );
       }
-      retryPrimaryAfter = now() + 5 * 60_000;
+
       schedulePrimaryRetry(ctx);
     }
   }
@@ -514,16 +752,19 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
       return;
     }
 
-    const primary = cfg.primaryProvider;
     const fallback = cfg.fallbackProvider;
 
-    const mode = provider === primary ? "sub" : provider === fallback ? "api" : provider;
+    const mode = isPrimaryProvider(provider) ? "sub" : provider === fallback ? "api" : provider;
 
     let msg = ctx.ui.theme.fg("muted", `${EXT}:`);
     msg += " " + ctx.ui.theme.fg("accent", mode);
 
     if (managedModelId) {
       msg += " " + ctx.ui.theme.fg("dim", managedModelId);
+    }
+
+    if (isPrimaryProvider(provider) && primaryProviders.length > 1) {
+      msg += " " + ctx.ui.theme.fg("dim", `(${formatPrimaryProviderLabel(provider)})`);
     }
 
     if (provider === fallback && cfg.fallbackProvider === "openai" && fallbackAccounts.length > 1) {
@@ -535,18 +776,26 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
 
     if (retryPrimaryAfter && provider === fallback) {
       const mins = Math.max(0, Math.ceil((retryPrimaryAfter - now()) / 60000));
-      msg += " " + ctx.ui.theme.fg("dim", `(try sub again in ~${mins}m)`);
+      msg += " " + ctx.ui.theme.fg("dim", `(try subscription again in ~${mins}m)`);
     }
 
     ctx.ui.setStatus(EXT, msg);
   }
 
   function canManageModelId(ctx: any, modelId: string): boolean {
-    const primary = cfg?.primaryProvider;
     const fallback = cfg?.fallbackProvider;
-    if (!primary || !fallback) return false;
+    if (!fallback) return false;
 
-    return Boolean(ctx.modelRegistry.find(primary, modelId) && ctx.modelRegistry.find(fallback, modelId));
+    if (!ctx.modelRegistry.find(fallback, modelId)) return false;
+
+    // We only manage switching if the model id exists in ALL configured primary providers.
+    // This keeps behavior predictable when rotating among multiple OAuth accounts.
+    if (primaryProviders.length === 0) return false;
+    for (const p of primaryProviders) {
+      if (!ctx.modelRegistry.find(p, modelId)) return false;
+    }
+
+    return true;
   }
 
   function resolveManagedModelId(ctx: any): string | undefined {
@@ -604,7 +853,8 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     activeProvider = provider;
     activeModelId = managedModelId;
 
-    if (provider === cfg.primaryProvider) {
+    if (isPrimaryProvider(provider)) {
+      clearPrimaryCooldown(provider);
       retryPrimaryAfter = 0;
       clearRetryTimer();
     } else if (provider === cfg.fallbackProvider && retryPrimaryAfter) {
@@ -612,8 +862,11 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     }
 
     if (ctx.hasUI) {
-      const label =
-        provider === cfg.primaryProvider ? "subscription" : provider === cfg.fallbackProvider ? "API credits" : provider;
+      const label = isPrimaryProvider(provider)
+        ? "subscription"
+        : provider === cfg.fallbackProvider
+          ? "API credits"
+          : provider;
 
       let extra = "";
       if (provider === cfg.fallbackProvider && cfg.fallbackProvider === "openai" && fallbackAccounts.length > 0) {
@@ -652,7 +905,7 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
             "Commands:\n" +
             "  reload | (no args)   Reload config + show status\n" +
             "  on / off             Enable/disable extension\n" +
-            "  primary              Force subscription provider (default: openai-codex)\n" +
+            "  primary [providerId] Force subscription provider (first of primaryProviders by default)\n" +
             "  fallback             Force API-key provider (default: openai)\n" +
             "  simulate [mins] [err] Simulate a subscription limit for testing\n" +
             "  selftest [ms]        Quick self-test (parse + timer + switch-back)";
@@ -667,7 +920,10 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
         restoreOriginalOpenAIEnv();
         if (ctx.hasUI) ctx.ui.setStatus(EXT, undefined);
       } else if (cmd === "primary") {
-        const switched = await switchToProvider(ctx, cfg.primaryProvider!, "forced");
+        const requested = parts[1] ? String(parts[1]).trim() : "";
+        const target = requested || selectBestPrimaryProvider() || primaryProviders[0] || "openai-codex";
+
+        const switched = await switchToProvider(ctx, target, "forced");
         if (switched) {
           retryPrimaryAfter = 0;
           clearRetryTimer();
@@ -694,7 +950,7 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
         }
 
         managedModelId = managedModelId ?? resolveManagedModelId(ctx);
-        if (managedModelId && ctx.model?.provider === cfg.primaryProvider) {
+        if (managedModelId && isPrimaryProvider(ctx.model?.provider)) {
           await switchToProvider(ctx, cfg.fallbackProvider!, "simulated rate limit");
         }
       } else if (cmd === "selftest") {
@@ -714,7 +970,8 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
           const msRaw = parts[1] ? Number(parts[1]) : 250;
           const ms = Number.isFinite(msRaw) && msRaw >= 50 && msRaw <= 5000 ? Math.floor(msRaw) : 250;
 
-          await switchToProvider(ctx, cfg.primaryProvider!, "selftest setup");
+          const primary = selectBestPrimaryProvider() || primaryProviders[0] || "openai-codex";
+          await switchToProvider(ctx, primary, "selftest setup");
 
           const resetAtMs = now() + ms;
           const fakeErr = `{"resets_at": ${resetAtMs}}`;
@@ -736,7 +993,7 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
 
             setTimeout(() => {
               const provider = activeProvider ?? lastCtx?.model?.provider;
-              const ok = provider === cfg?.primaryProvider;
+              const ok = isPrimaryProvider(provider);
               if (lastCtx?.hasUI) {
                 lastCtx.ui.notify(
                   `[${EXT}] Selftest ${ok ? "PASS" : "FAIL"}: active=${provider ?? "unknown"} managedId=${managedModelId}`,
@@ -753,7 +1010,7 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
             "Commands:\n" +
             "  reload | (no args)   Reload config + show status\n" +
             "  on / off             Enable/disable extension\n" +
-            "  primary              Force subscription provider (default: openai-codex)\n" +
+            "  primary [providerId] Force subscription provider (first of primaryProviders by default)\n" +
             "  fallback             Force API-key provider (default: openai)\n" +
             "  simulate [mins] [err] Simulate a subscription limit for testing\n" +
             "  selftest [ms]        Quick self-test (parse + timer + switch-back)";
@@ -771,7 +1028,7 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
         const active =
           !provider
             ? "none"
-            : provider === cfg.primaryProvider
+            : isPrimaryProvider(provider)
               ? "primary"
               : provider === cfg.fallbackProvider
                 ? "fallback"
@@ -783,7 +1040,7 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
             : "";
 
         ctx.ui.notify(
-          `[${EXT}] enabled=${cfg.enabled} active=${active}${acctInfo} primary=${cfg.primaryProvider} fallback=${cfg.fallbackProvider} model=${model} managedId=${managed}`,
+          `[${EXT}] enabled=${cfg.enabled} active=${active}${acctInfo} primaries=[${primaryProviders.join(",")}] fallback=${cfg.fallbackProvider} model=${model} managedId=${managed}`,
           "info",
         );
       }
@@ -823,21 +1080,7 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     rememberActiveFromCtx(ctx);
 
     if (retryPrimaryAfter && now() >= retryPrimaryAfter) {
-      const provider = activeProvider ?? ctx.model?.provider;
-      const id = activeModelId ?? ctx.model?.id;
-
-      if (provider === cfg.fallbackProvider && id === managedModelId) {
-        const switched = await switchToProvider(ctx, cfg.primaryProvider!, "cooldown expired");
-        if (switched) {
-          retryPrimaryAfter = 0;
-          clearRetryTimer();
-        } else {
-          retryPrimaryAfter = now() + 5 * 60_000;
-          schedulePrimaryRetry(ctx);
-        }
-      } else {
-        clearRetryTimer();
-      }
+      await maybeSwitchBackToPrimary("cooldown expired");
     } else if (retryPrimaryAfter) {
       schedulePrimaryRetry(ctx);
     }
@@ -861,7 +1104,7 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     if (isExtensionSwitch) {
       pendingExtensionSwitch = undefined;
 
-      if (activeProvider === cfg.primaryProvider) {
+      if (isPrimaryProvider(activeProvider)) {
         retryPrimaryAfter = 0;
         clearRetryTimer();
       } else if (activeProvider === cfg.fallbackProvider && retryPrimaryAfter) {
@@ -920,14 +1163,35 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
 
     if (!isRateLimitError(err, cfg.rateLimitPatterns)) return;
 
-    // 1) Subscription provider hit usage/rate limits -> switch to API credits
-    if (provider === cfg.primaryProvider) {
+    // 1) Primary (OAuth) provider hit usage/rate limits -> try other primaries, else use API credits
+    if (isPrimaryProvider(provider)) {
       const parsedRetryMs = parseRetryAfterMs(err);
-      const fallbackRetryMs = (cfg.cooldownMinutes ?? 180) * 60_000;
+      const cooldownMs = (cfg.cooldownMinutes ?? 180) * 60_000;
       const bufferMs = 15_000;
-      retryPrimaryAfter = now() + (parsedRetryMs ?? fallbackRetryMs) + bufferMs;
+      const until = now() + (parsedRetryMs ?? cooldownMs) + bufferMs;
+
+      setPrimaryCooldown(provider, until);
       schedulePrimaryRetry(ctx);
 
+      const nextPrimary = selectNextPrimaryProvider(provider);
+      if (nextPrimary) {
+        if (ctx.hasUI) {
+          const source = parsedRetryMs !== undefined ? "(from provider reset hint)" : "(from configured cooldown)";
+          ctx.ui.notify(
+            `[${EXT}] Subscription appears rate-limited (${formatPrimaryProviderLabel(provider)}); switching to ${formatPrimaryProviderLabel(nextPrimary)}… ${source}`,
+            "warning",
+          );
+        }
+
+        await switchToProvider(ctx, nextPrimary, "rate limited");
+        updateStatus(ctx);
+
+        // NOTE: We intentionally do not auto-resend here.
+        // pi core may auto-retry; resending can double-send.
+        return;
+      }
+
+      // No other primary is configured/available; fall back to API credits.
       if (ctx.hasUI) {
         const mins = Math.max(0, Math.ceil((retryPrimaryAfter - now()) / 60000));
         const source = parsedRetryMs !== undefined ? "(from provider reset hint)" : "(from configured cooldown)";
