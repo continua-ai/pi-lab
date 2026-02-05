@@ -48,7 +48,7 @@ interface Config {
    * Optional: multiple subscription providers (OAuth) to rotate through before using API credits.
    * If set, this overrides primaryProvider.
    *
-   * Example: ["openai-codex-personal", "openai-codex-work"]
+   * Example: ["openai-codex", "openai-codex-work"]
    */
   primaryProviders?: string[];
 
@@ -328,16 +328,33 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
   }
 
   function normalizePrimaryProviders(nextCfg: Config): string[] {
-    const list = Array.isArray(nextCfg.primaryProviders)
+    const raw = Array.isArray(nextCfg.primaryProviders)
       ? nextCfg.primaryProviders.map((p) => String(p).trim()).filter(Boolean)
       : [];
-    if (list.length > 0) return list;
 
-    const single = String(nextCfg.primaryProvider ?? "openai-codex").trim();
-    return single ? [single] : ["openai-codex"];
+    const list = raw.length > 0 ? raw : [String(nextCfg.primaryProvider ?? "openai-codex").trim() || "openai-codex"];
+
+    // Normalize + de-dupe while preserving order.
+    const out: string[] = [];
+    const seen = new Set<string>();
+
+    for (const p of list) {
+      let id = p;
+
+      // Back-compat: we used to recommend openai-codex-personal, but that creates a confusing
+      // third profile alongside the built-in openai-codex provider.
+      if (id === "openai-codex-personal") id = "openai-codex";
+
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
+    }
+
+    return out.length > 0 ? out : ["openai-codex"];
   }
 
   function formatPrimaryProviderLabel(provider: string): string {
+    if (provider === "openai-codex") return "personal";
     if (provider.startsWith("openai-codex-")) {
       const suffix = provider.slice("openai-codex-".length);
       return suffix || provider;
@@ -455,9 +472,36 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     }
   }
 
+  function registerCodexPersonalProviderLabel(): void {
+    // Re-register openai-codex OAuth provider with a clearer name so the /login menu reads
+    // as "personal" vs "work" (and avoids a confusing third alias).
+    pi.registerProvider("openai-codex", {
+      oauth: {
+        name: "ChatGPT Plus/Pro (Codex Subscription) (personal)",
+        async login(callbacks: any) {
+          return loginOpenAICodex({
+            onAuth: callbacks.onAuth,
+            onPrompt: callbacks.onPrompt,
+            onProgress: callbacks.onProgress,
+            onManualCodeInput: callbacks.onManualCodeInput,
+            originator: "openai-codex",
+          });
+        },
+        async refreshToken(credentials: any) {
+          return refreshOpenAICodexToken(String(credentials.refresh));
+        },
+        getApiKey(credentials: any) {
+          return String(credentials.access);
+        },
+      },
+    });
+  }
+
   function registerCodexAliasesAtStartup(): void {
     if (codexAliasesRegistered) return;
     codexAliasesRegistered = true;
+
+    registerCodexPersonalProviderLabel();
 
     // Register any aliases declared in config (so `/login <alias>` works).
     // NOTE: changing primaryProviders requires a pi restart for new aliases to appear.
@@ -470,8 +514,7 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
       ids.add(p);
     }
 
-    // Two standard aliases for the common "2 accounts" case.
-    ids.add("openai-codex-personal");
+    // Register a single standard alias for the common "2 accounts" case.
     ids.add("openai-codex-work");
 
     for (const id of ids) {

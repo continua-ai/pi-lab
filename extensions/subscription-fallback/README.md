@@ -79,21 +79,23 @@ Project-local values override global.
 
 ### Multiple ChatGPT OAuth accounts (subscription aliases)
 
-pi stores OAuth credentials **per provider id**. This extension registers two common alias providers:
+pi stores OAuth credentials **per provider id**.
 
-- `openai-codex-personal`
-- `openai-codex-work`
+To avoid a confusing extra "Codex" profile, this extension treats the built-in `openai-codex` provider as your **personal** account, and registers a single additional alias provider for your **work** account:
+
+- `openai-codex` (personal)
+- `openai-codex-work` (work)
 
 Log into both:
 
-- `/login openai-codex-personal`
-- `/login openai-codex-work`
+- `/login` → select **ChatGPT Plus/Pro (Codex Subscription) (personal)**
+- `/login` → select **ChatGPT Plus/Pro (Codex Subscription) (work)**
 
 Then configure `primaryProviders` so `/subswitch` can rotate between them:
 
 ```json
 {
-  "primaryProviders": ["openai-codex-personal", "openai-codex-work"],
+  "primaryProviders": ["openai-codex-work", "openai-codex"],
   "fallbackProvider": "openai",
   "cooldownMinutes": 180
 }
