@@ -15,6 +15,26 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 type InputSource = "interactive" | "rpc" | "extension";
 
+interface OpenAIAccount {
+  /** Optional label for UI/logging (never includes the API key). */
+  name?: string;
+
+  /** Environment variable name containing an OpenAI API key (preferred). */
+  apiKeyEnv?: string;
+
+  /** Path to a file containing an OpenAI API key (trimmed). Supports ~/... */
+  apiKeyPath?: string;
+
+  /** Raw API key (discouraged; prefer apiKeyEnv/apiKeyPath). */
+  apiKey?: string;
+
+  /** Optional env var name containing OPENAI_ORG_ID for this account. */
+  openaiOrgIdEnv?: string;
+
+  /** Optional env var name containing OPENAI_PROJECT_ID for this account. */
+  openaiProjectIdEnv?: string;
+}
+
 interface Config {
   /** Master switch */
   enabled?: boolean;
@@ -36,6 +56,18 @@ interface Config {
 
   /** Extra substrings (case-insensitive) that should count as "rate limited". */
   rateLimitPatterns?: string[];
+
+  /**
+   * Optional: rotate among multiple OpenAI accounts while using the fallback provider.
+   * Only supported when fallbackProvider is "openai".
+   */
+  fallbackAccounts?: OpenAIAccount[];
+
+  /**
+   * Default cooldown for a fallback OpenAI account when rate-limited and no retry hint is present.
+   * Default: 15
+   */
+  fallbackAccountCooldownMinutes?: number;
 }
 
 const EXT = "subscription-fallback";
@@ -72,6 +104,7 @@ function loadConfig(cwd: string): Config {
     cooldownMinutes: 180,
     autoRetry: true,
     rateLimitPatterns: [],
+    fallbackAccountCooldownMinutes: 15,
     ...globalCfg,
     ...projectCfg,
   };
@@ -83,6 +116,8 @@ function loadConfig(cwd: string): Config {
   merged.cooldownMinutes = merged.cooldownMinutes ?? 180;
   merged.autoRetry = merged.autoRetry ?? true;
   merged.rateLimitPatterns = merged.rateLimitPatterns ?? [];
+  merged.fallbackAccountCooldownMinutes = merged.fallbackAccountCooldownMinutes ?? 15;
+  merged.fallbackAccounts = Array.isArray(merged.fallbackAccounts) ? merged.fallbackAccounts : undefined;
 
   return merged;
 }
@@ -187,7 +222,23 @@ function parseRetryAfterMs(err: unknown): number | undefined {
 export default function subscriptionFallback(pi: ExtensionAPI) {
   let cfg: Config | undefined;
   let managedModelId: string | undefined;
+
+  // When we last hit the subscription limit; used to decide when to try primary again.
   let retryPrimaryAfter = 0;
+
+  // Optional: rotate among multiple OpenAI API keys while using the fallback provider.
+  let fallbackAccounts: OpenAIAccount[] = [];
+  let activeFallbackAccountIndex = 0;
+  let fallbackAccountRetryAfter: number[] = [];
+
+  // If we mutate OPENAI_* env vars, capture the originals so `/subswitch off` can restore them.
+  let originalOpenAIEnv:
+    | {
+        apiKey?: string;
+        orgId?: string;
+        projectId?: string;
+      }
+    | undefined;
 
   let pendingInputSource: InputSource | undefined;
   let lastPrompt:
@@ -215,6 +266,161 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
 
   function now(): number {
     return Date.now();
+  }
+
+  function expandHome(path: string): string {
+    if (path.startsWith("~/")) {
+      return join(homedir(), path.slice(2));
+    }
+    return path;
+  }
+
+  function setCfg(nextCfg: Config): void {
+    cfg = nextCfg;
+
+    // Only support multi-account rotation for the built-in "openai" provider.
+    fallbackAccounts = nextCfg.fallbackProvider === "openai" ? (nextCfg.fallbackAccounts ?? []) : [];
+    activeFallbackAccountIndex = 0;
+    fallbackAccountRetryAfter = fallbackAccounts.map(() => 0);
+  }
+
+  function ensureCfg(ctx: any): Config {
+    if (!cfg) {
+      setCfg(loadConfig(ctx.cwd));
+    }
+    return cfg;
+  }
+
+  function reloadCfg(ctx: any): void {
+    setCfg(loadConfig(ctx.cwd));
+  }
+
+  function captureOriginalOpenAIEnv(): void {
+    if (originalOpenAIEnv) return;
+    originalOpenAIEnv = {
+      apiKey: process.env.OPENAI_API_KEY,
+      orgId: process.env.OPENAI_ORG_ID,
+      projectId: process.env.OPENAI_PROJECT_ID,
+    };
+  }
+
+  function restoreOriginalOpenAIEnv(): void {
+    if (!originalOpenAIEnv) return;
+
+    if (originalOpenAIEnv.apiKey === undefined) {
+      delete process.env.OPENAI_API_KEY;
+    } else {
+      process.env.OPENAI_API_KEY = originalOpenAIEnv.apiKey;
+    }
+
+    if (originalOpenAIEnv.orgId === undefined) {
+      delete process.env.OPENAI_ORG_ID;
+    } else {
+      process.env.OPENAI_ORG_ID = originalOpenAIEnv.orgId;
+    }
+
+    if (originalOpenAIEnv.projectId === undefined) {
+      delete process.env.OPENAI_PROJECT_ID;
+    } else {
+      process.env.OPENAI_PROJECT_ID = originalOpenAIEnv.projectId;
+    }
+
+    originalOpenAIEnv = undefined;
+  }
+
+  function resolveAccountApiKey(acct: OpenAIAccount): string | undefined {
+    if (acct.apiKeyEnv) {
+      const v = process.env[acct.apiKeyEnv];
+      if (v && v.trim()) return v.trim();
+    }
+
+    if (acct.apiKeyPath) {
+      const p = expandHome(acct.apiKeyPath);
+      if (existsSync(p)) {
+        const v = readFileSync(p, "utf-8").trim();
+        if (v) return v;
+      }
+    }
+
+    if (acct.apiKey && acct.apiKey.trim()) return acct.apiKey.trim();
+
+    return undefined;
+  }
+
+  function resolveAccountLabel(acct: OpenAIAccount, index: number): string {
+    if (acct.name && acct.name.trim()) return acct.name.trim();
+    if (acct.apiKeyEnv && acct.apiKeyEnv.trim()) return acct.apiKeyEnv.trim();
+    return `acct${index + 1}`;
+  }
+
+  function canUseFallbackAccount(index: number): boolean {
+    if (index < 0 || index >= fallbackAccounts.length) return false;
+    const until = fallbackAccountRetryAfter[index] ?? 0;
+    if (until && now() < until) return false;
+    return resolveAccountApiKey(fallbackAccounts[index]) !== undefined;
+  }
+
+  function selectNextFallbackAccountIndex(startAt: number): number | undefined {
+    if (fallbackAccounts.length === 0) return undefined;
+
+    for (let offset = 0; offset < fallbackAccounts.length; offset++) {
+      const idx = (startAt + offset) % fallbackAccounts.length;
+      if (canUseFallbackAccount(idx)) return idx;
+    }
+
+    return undefined;
+  }
+
+  function activateFallbackAccount(ctx: any, index: number, reason: string, notify: boolean): boolean {
+    const acct = fallbackAccounts[index];
+    if (!acct) return false;
+
+    const key = resolveAccountApiKey(acct);
+    if (!key) return false;
+
+    captureOriginalOpenAIEnv();
+
+    // We only support rotating OPENAI_* for the built-in "openai" provider.
+    process.env.OPENAI_API_KEY = key;
+
+    if (acct.openaiOrgIdEnv) {
+      const org = process.env[acct.openaiOrgIdEnv];
+      if (org && org.trim()) process.env.OPENAI_ORG_ID = org.trim();
+      else delete process.env.OPENAI_ORG_ID;
+    } else {
+      delete process.env.OPENAI_ORG_ID;
+    }
+
+    if (acct.openaiProjectIdEnv) {
+      const project = process.env[acct.openaiProjectIdEnv];
+      if (project && project.trim()) process.env.OPENAI_PROJECT_ID = project.trim();
+      else delete process.env.OPENAI_PROJECT_ID;
+    } else {
+      delete process.env.OPENAI_PROJECT_ID;
+    }
+
+    activeFallbackAccountIndex = index;
+
+    if (notify && ctx.hasUI) {
+      const label = resolveAccountLabel(acct, index);
+      ctx.ui.notify(`[${EXT}] Using OpenAI account '${label}' (${reason})`, "info");
+    }
+
+    return true;
+  }
+
+  function ensureFallbackAccountSelected(ctx: any, reason: string): boolean {
+    if (!cfg?.enabled) return false;
+    if (cfg.fallbackProvider !== "openai") return true;
+    if (fallbackAccounts.length === 0) return true;
+
+    if (canUseFallbackAccount(activeFallbackAccountIndex)) {
+      return activateFallbackAccount(ctx, activeFallbackAccountIndex, reason, false);
+    }
+
+    const idx = selectNextFallbackAccountIndex(0);
+    if (idx === undefined) return false;
+    return activateFallbackAccount(ctx, idx, reason, false);
   }
 
   function rememberActiveFromCtx(ctx: any): void {
@@ -320,6 +526,13 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
       msg += " " + ctx.ui.theme.fg("dim", managedModelId);
     }
 
+    if (provider === fallback && cfg.fallbackProvider === "openai" && fallbackAccounts.length > 1) {
+      const acct = fallbackAccounts[activeFallbackAccountIndex];
+      if (acct) {
+        msg += " " + ctx.ui.theme.fg("dim", `(acct ${resolveAccountLabel(acct, activeFallbackAccountIndex)})`);
+      }
+    }
+
     if (retryPrimaryAfter && provider === fallback) {
       const mins = Math.max(0, Math.ceil((retryPrimaryAfter - now()) / 60000));
       msg += " " + ctx.ui.theme.fg("dim", `(try sub again in ~${mins}m)`);
@@ -355,6 +568,19 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
 
     lastCtx = ctx;
 
+    if (provider === cfg.fallbackProvider) {
+      const ok = ensureFallbackAccountSelected(ctx, `switching to ${provider}`);
+      if (!ok) {
+        if (ctx.hasUI) {
+          ctx.ui.notify(
+            `[${EXT}] No usable OpenAI fallback account credentials found (check fallbackAccounts/apiKeyEnv/apiKeyPath)`,
+            "warning",
+          );
+        }
+        return false;
+      }
+    }
+
     const model = ctx.modelRegistry.find(provider, managedModelId);
     if (!model) {
       if (ctx.hasUI) ctx.ui.notify(`[${EXT}] No model ${provider}/${managedModelId} (${reason})`, "warning");
@@ -388,7 +614,16 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     if (ctx.hasUI) {
       const label =
         provider === cfg.primaryProvider ? "subscription" : provider === cfg.fallbackProvider ? "API credits" : provider;
-      ctx.ui.notify(`[${EXT}] Switched to ${label} (${provider}/${managedModelId})`, "info");
+
+      let extra = "";
+      if (provider === cfg.fallbackProvider && cfg.fallbackProvider === "openai" && fallbackAccounts.length > 0) {
+        const acct = fallbackAccounts[activeFallbackAccountIndex];
+        if (acct) {
+          extra = ` (acct ${resolveAccountLabel(acct, activeFallbackAccountIndex)})`;
+        }
+      }
+
+      ctx.ui.notify(`[${EXT}] Switched to ${label}${extra} (${provider}/${managedModelId})`, "info");
     }
 
     updateStatus(ctx);
@@ -403,7 +638,7 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
   pi.registerCommand("subswitch", {
     description: "Subscription↔API model auto-fallback (status/help/reload/force)",
     handler: async (args, ctx) => {
-      cfg = loadConfig(ctx.cwd);
+      reloadCfg(ctx);
       managedModelId = resolveManagedModelId(ctx);
       rememberActiveFromCtx(ctx);
 
@@ -429,6 +664,7 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
         cfg.enabled = false;
         retryPrimaryAfter = 0;
         clearRetryTimer();
+        restoreOriginalOpenAIEnv();
         if (ctx.hasUI) ctx.ui.setStatus(EXT, undefined);
       } else if (cmd === "primary") {
         const switched = await switchToProvider(ctx, cfg.primaryProvider!, "forced");
@@ -541,8 +777,13 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
                 ? "fallback"
                 : `other:${provider}`;
 
+        const acctInfo =
+          provider === cfg.fallbackProvider && cfg.fallbackProvider === "openai" && fallbackAccounts.length > 0
+            ? ` acct=${resolveAccountLabel(fallbackAccounts[activeFallbackAccountIndex], activeFallbackAccountIndex)}`
+            : "";
+
         ctx.ui.notify(
-          `[${EXT}] enabled=${cfg.enabled} active=${active} primary=${cfg.primaryProvider} fallback=${cfg.fallbackProvider} model=${model} managedId=${managed}`,
+          `[${EXT}] enabled=${cfg.enabled} active=${active}${acctInfo} primary=${cfg.primaryProvider} fallback=${cfg.fallbackProvider} model=${model} managedId=${managed}`,
           "info",
         );
       }
@@ -556,10 +797,15 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
-    cfg = cfg ?? loadConfig(ctx.cwd);
-    if (!cfg.enabled) return;
+    ensureCfg(ctx);
+    if (!cfg?.enabled) return;
 
     rememberActiveFromCtx(ctx);
+
+    // If we're already on the fallback provider, make sure the selected account is applied.
+    if ((activeProvider ?? ctx.model?.provider) === cfg.fallbackProvider) {
+      ensureFallbackAccountSelected(ctx, "before agent start");
+    }
 
     managedModelId = managedModelId ?? resolveManagedModelId(ctx);
     if (!managedModelId) {
@@ -600,8 +846,8 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
   });
 
   pi.on("model_select", async (event, ctx) => {
-    cfg = cfg ?? loadConfig(ctx.cwd);
-    if (!cfg.enabled) return;
+    ensureCfg(ctx);
+    if (!cfg?.enabled) return;
 
     lastCtx = ctx;
     activeProvider = event.model?.provider;
@@ -645,12 +891,16 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
       clearRetryTimer();
     }
 
+    if (activeProvider === cfg.fallbackProvider) {
+      ensureFallbackAccountSelected(ctx, "model select");
+    }
+
     updateStatus(ctx);
   });
 
   pi.on("turn_end", async (event, ctx) => {
-    cfg = cfg ?? loadConfig(ctx.cwd);
-    if (!cfg.enabled) return;
+    ensureCfg(ctx);
+    if (!cfg?.enabled) return;
 
     rememberActiveFromCtx(ctx);
 
@@ -662,43 +912,105 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
 
     const err = msg?.errorMessage ?? msg?.details?.error ?? msg?.error ?? "unknown error";
 
-    if (ctx.model?.provider !== cfg.primaryProvider) return;
-    if (ctx.model?.id !== managedModelId) return;
+    const provider = ctx.model?.provider;
+    const id = ctx.model?.id;
+
+    if (!provider || !id) return;
+    if (id !== managedModelId) return;
 
     if (!isRateLimitError(err, cfg.rateLimitPatterns)) return;
 
-    const parsedRetryMs = parseRetryAfterMs(err);
-    const fallbackRetryMs = (cfg.cooldownMinutes ?? 180) * 60_000;
-    const bufferMs = 15_000;
-    retryPrimaryAfter = now() + (parsedRetryMs ?? fallbackRetryMs) + bufferMs;
-    schedulePrimaryRetry(ctx);
+    // 1) Subscription provider hit usage/rate limits -> switch to API credits
+    if (provider === cfg.primaryProvider) {
+      const parsedRetryMs = parseRetryAfterMs(err);
+      const fallbackRetryMs = (cfg.cooldownMinutes ?? 180) * 60_000;
+      const bufferMs = 15_000;
+      retryPrimaryAfter = now() + (parsedRetryMs ?? fallbackRetryMs) + bufferMs;
+      schedulePrimaryRetry(ctx);
 
-    if (ctx.hasUI) {
-      const mins = Math.max(0, Math.ceil((retryPrimaryAfter - now()) / 60000));
-      const source = parsedRetryMs !== undefined ? "(from provider reset hint)" : "(from configured cooldown)";
-      ctx.ui.notify(
-        `[${EXT}] Subscription appears rate-limited; switching to API credits… Will try subscription again in ~${mins}m ${source}`,
-        "warning",
-      );
+      if (ctx.hasUI) {
+        const mins = Math.max(0, Math.ceil((retryPrimaryAfter - now()) / 60000));
+        const source = parsedRetryMs !== undefined ? "(from provider reset hint)" : "(from configured cooldown)";
+        ctx.ui.notify(
+          `[${EXT}] Subscription appears rate-limited; switching to API credits… Will try subscription again in ~${mins}m ${source}`,
+          "warning",
+        );
+      }
+
+      const switched = await switchToProvider(ctx, cfg.fallbackProvider!, "rate limited");
+      if (!switched) return;
+
+      if (cfg.autoRetry && lastPrompt && lastPrompt.source !== "extension") {
+        const content = buildUserMessageContent(lastPrompt.text, lastPrompt.images);
+        if (typeof ctx.isIdle === "function" && ctx.isIdle()) {
+          pi.sendUserMessage(content);
+        } else {
+          pi.sendUserMessage(content, { deliverAs: "followUp" });
+        }
+      }
+
+      return;
     }
 
-    const switched = await switchToProvider(ctx, cfg.fallbackProvider!, "rate limited");
-    if (!switched) return;
+    // 2) Fallback provider (openai) also got throttled -> rotate between multiple accounts
+    if (provider === cfg.fallbackProvider && cfg.fallbackProvider === "openai" && fallbackAccounts.length > 1) {
+      const parsedRetryMs = parseRetryAfterMs(err);
+      const cooldownMs = (cfg.fallbackAccountCooldownMinutes ?? 15) * 60_000;
+      const bufferMs = 5_000;
+      const until = now() + (parsedRetryMs ?? cooldownMs) + bufferMs;
 
-    if (cfg.autoRetry && lastPrompt && lastPrompt.source !== "extension") {
-      const content = buildUserMessageContent(lastPrompt.text, lastPrompt.images);
-      if (typeof ctx.isIdle === "function" && ctx.isIdle()) {
-        pi.sendUserMessage(content);
-      } else {
-        pi.sendUserMessage(content, { deliverAs: "followUp" });
+      // Mark current account as cooled down.
+      if (activeFallbackAccountIndex >= 0 && activeFallbackAccountIndex < fallbackAccounts.length) {
+        fallbackAccountRetryAfter[activeFallbackAccountIndex] = until;
+      }
+
+      const nextIdx = selectNextFallbackAccountIndex(activeFallbackAccountIndex + 1);
+      if (nextIdx === undefined || nextIdx === activeFallbackAccountIndex) {
+        if (ctx.hasUI) {
+          const mins = Math.max(0, Math.ceil((until - now()) / 60000));
+          ctx.ui.notify(
+            `[${EXT}] API credits appear rate-limited and no other configured OpenAI account is available (next retry ~${mins}m)`,
+            "warning",
+          );
+        }
+        updateStatus(ctx);
+        return;
+      }
+
+      const ok = activateFallbackAccount(ctx, nextIdx, "rotating after rate limit", false);
+      if (!ok) {
+        updateStatus(ctx);
+        return;
+      }
+
+      if (ctx.hasUI) {
+        const label = resolveAccountLabel(fallbackAccounts[nextIdx], nextIdx);
+        const hint = parsedRetryMs !== undefined ? "(from provider retry hint)" : "(from configured cooldown)";
+        ctx.ui.notify(`[${EXT}] API credits rate-limited; switching OpenAI account to '${label}' ${hint}`, "warning");
+      }
+
+      updateStatus(ctx);
+
+      if (cfg.autoRetry && lastPrompt && lastPrompt.source !== "extension") {
+        const content = buildUserMessageContent(lastPrompt.text, lastPrompt.images);
+        if (typeof ctx.isIdle === "function" && ctx.isIdle()) {
+          pi.sendUserMessage(content);
+        } else {
+          pi.sendUserMessage(content, { deliverAs: "followUp" });
+        }
       }
     }
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    cfg = loadConfig(ctx.cwd);
+    reloadCfg(ctx);
     managedModelId = resolveManagedModelId(ctx);
     rememberActiveFromCtx(ctx);
+
+    // If the session starts on the fallback provider, make sure the selected account is applied.
+    if (cfg?.enabled && (activeProvider ?? ctx.model?.provider) === cfg.fallbackProvider) {
+      ensureFallbackAccountSelected(ctx, "session start");
+    }
 
     clearRetryTimer();
     if (retryPrimaryAfter) {
@@ -710,5 +1022,6 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     clearRetryTimer();
+    restoreOriginalOpenAIEnv();
   });
 }

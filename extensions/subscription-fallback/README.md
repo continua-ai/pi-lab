@@ -25,7 +25,7 @@ cp -r extensions/subscription-fallback/index.ts ~/.pi/agent/extensions/subscript
 ## Prerequisites
 
 - Subscription provider: run `pi`, then `/login` (default provider name used by this extension: `openai-codex`).
-- API credits provider: set `OPENAI_API_KEY` in your environment.
+- API credits provider: set `OPENAI_API_KEY` in your environment (or configure `fallbackAccounts` to rotate between multiple keys).
 
 ## Commands
 
@@ -74,6 +74,35 @@ Project-local values override global.
   ]
 }
 ```
+
+### Multiple OpenAI accounts (API key rotation)
+
+If your **fallback provider is `openai`** and you have multiple OpenAI API keys, you can configure the extension to rotate between them when one key gets throttled (429 / rate limit).
+
+1) Put each key in its own env var (example):
+
+```bash
+export OPENAI_API_KEY_PERSONAL='...'
+export OPENAI_API_KEY_WORK='...'
+```
+
+2) Configure `fallbackAccounts` to reference those env vars:
+
+```json
+{
+  "fallbackProvider": "openai",
+  "fallbackAccounts": [
+    { "name": "personal", "apiKeyEnv": "OPENAI_API_KEY_PERSONAL" },
+    { "name": "work", "apiKeyEnv": "OPENAI_API_KEY_WORK" }
+  ],
+  "fallbackAccountCooldownMinutes": 15
+}
+```
+
+Notes:
+
+- The extension switches the **process** `OPENAI_API_KEY` at runtime (it does not print keys).
+- Rotation is only attempted when `fallbackAccounts.length > 1`.
 
 ## Notes / limitations
 
