@@ -12,6 +12,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { AutocompleteItem } from "@mariozechner/pi-tui";
 
 import { getModels, loginOpenAICodex, refreshOpenAICodexToken } from "@mariozechner/pi-ai";
 
@@ -933,6 +934,86 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
 
   pi.registerCommand("subswitch", {
     description: "Subscription↔API model auto-fallback (status/help/reload/force)",
+    getArgumentCompletions: (argumentPrefix: string): AutocompleteItem[] | null => {
+      const raw = argumentPrefix ?? "";
+      const endsWithSpace = /\s$/.test(raw);
+      const tokens = raw.trim().length > 0 ? raw.trim().split(/\s+/) : [];
+
+      const currentToken = endsWithSpace ? "" : (tokens[tokens.length - 1] ?? "");
+      const completedTokens = endsWithSpace ? tokens : tokens.slice(0, -1);
+
+      const cmd = completedTokens[0] ?? (endsWithSpace ? tokens[0] : undefined);
+
+      const mk = (value: string, description?: string): AutocompleteItem => ({
+        value,
+        label: value,
+        ...(description ? { description } : {}),
+      });
+
+      // Completing first argument (command)
+      if (completedTokens.length === 0) {
+        const commands: Array<{ value: string; description: string }> = [
+          { value: "reload", description: "Reload config + show status" },
+          { value: "help", description: "Show help" },
+          { value: "on", description: "Enable extension" },
+          { value: "off", description: "Disable extension" },
+          { value: "primary", description: "Force subscription provider" },
+          { value: "fallback", description: "Force API credits provider" },
+          { value: "simulate", description: "Simulate subscription limit" },
+          { value: "selftest", description: "Run selftest" },
+        ];
+
+        const pref = currentToken.toLowerCase();
+        return commands
+          .filter((c) => c.value.toLowerCase().startsWith(pref))
+          .map((c) => mk(c.value, c.description));
+      }
+
+      // Completing arguments for specific commands
+      if (cmd === "primary") {
+        // Only complete providerId as the 2nd argument.
+        if (completedTokens.length > 1) return null;
+
+        const providerPrefix = currentToken;
+
+        // Prefer the latest loaded cfg if available; fall back to reading from disk.
+        const cfgForCompletion = cfg ?? loadConfig(process.cwd());
+        const primaries = normalizePrimaryProviders(cfgForCompletion);
+
+        const items: AutocompleteItem[] = [];
+        for (const p of primaries) {
+          let desc = "primary provider";
+          if (p === "openai-codex-work") desc = "work subscription";
+          if (p === "openai-codex") desc = "personal subscription";
+          items.push(mk(p, desc));
+        }
+
+        const pref = providerPrefix.toLowerCase();
+        return items.filter((i) => i.value.toLowerCase().startsWith(pref));
+      }
+
+      if (cmd === "simulate") {
+        // /subswitch simulate [mins]
+        if (completedTokens.length > 1) return null;
+
+        const minsPrefix = currentToken;
+        const items = ["1", "5", "15", "60"].map((v) => mk(v, "minutes"));
+        const pref = minsPrefix.toLowerCase();
+        return items.filter((i) => i.value.toLowerCase().startsWith(pref));
+      }
+
+      if (cmd === "selftest") {
+        // /subswitch selftest [ms]
+        if (completedTokens.length > 1) return null;
+
+        const msPrefix = currentToken;
+        const items = ["250", "500", "1000", "2000"].map((v) => mk(v, "milliseconds"));
+        const pref = msPrefix.toLowerCase();
+        return items.filter((i) => i.value.toLowerCase().startsWith(pref));
+      }
+
+      return null;
+    },
     handler: async (args, ctx) => {
       reloadCfg(ctx);
       managedModelId = resolveManagedModelId(ctx);
