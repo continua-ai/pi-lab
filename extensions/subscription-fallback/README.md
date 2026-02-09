@@ -81,6 +81,8 @@ Project-local values override global.
 Notes:
 
 - `preferPrimaryOnStartup` (default: `true`): if pi restores your last model on the fallback provider (API-key mode), the extension will immediately try to switch back to a subscription provider on startup.
+- `autoRetry` (default: `true`): if the active subscription provider is rate-limited and the extension switches to another provider, it will automatically re-send your last prompt.
+- OpenAI Responses API mitigation: when the fallback provider uses `openai-responses`, the extension strips prior thinking blocks from the request context to avoid repeated 404s for non-persisted `rs_...` items.
 
 ### Multiple ChatGPT OAuth accounts (subscription aliases)
 

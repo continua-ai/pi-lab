@@ -1279,6 +1279,40 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     updateStatus(ctx);
   });
 
+  pi.on("context", async (event, ctx) => {
+    ensureCfg(ctx);
+    if (!cfg?.enabled) return;
+
+    // Mitigation for OpenAI Responses API:
+    // OpenAI rejects replaying prior reasoning items by id (rs_...) when `store` is false
+    // (which is the default for many setups). This can wedge a session with repeated 404s.
+    //
+    // The root fix belongs in @mariozechner/pi-ai (convertResponsesMessages should not
+    // replay reasoning items when store=false), but we can avoid the wedge here by stripping
+    // thinking blocks before they are converted into Responses input items.
+    const model = ctx.model;
+    if (!model) return;
+    if (model.api !== "openai-responses") return;
+
+    // Only apply to the fallback provider (typically "openai").
+    if (model.provider !== cfg.fallbackProvider) return;
+
+    let changed = false;
+    for (const m of event.messages) {
+      if (m.role !== "assistant") continue;
+      const content = (m as any).content;
+      if (!Array.isArray(content)) continue;
+
+      const filtered = content.filter((b: any) => b?.type !== "thinking");
+      if (filtered.length !== content.length) {
+        (m as any).content = filtered;
+        changed = true;
+      }
+    }
+
+    if (changed) return { messages: event.messages };
+  });
+
   pi.on("turn_end", async (event, ctx) => {
     ensureCfg(ctx);
     if (!cfg?.enabled) return;
@@ -1321,11 +1355,18 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
           );
         }
 
-        await switchToProvider(ctx, nextPrimary, "rate limited");
+        const switched = await switchToProvider(ctx, nextPrimary, "rate limited");
         updateStatus(ctx);
 
-        // NOTE: We intentionally do not auto-resend here.
-        // pi core may auto-retry; resending can double-send.
+        if (switched && cfg.autoRetry && lastPrompt && lastPrompt.source !== "extension") {
+          const content = buildUserMessageContent(lastPrompt.text, lastPrompt.images);
+          if (typeof ctx.isIdle === "function" && ctx.isIdle()) {
+            pi.sendUserMessage(content);
+          } else {
+            pi.sendUserMessage(content, { deliverAs: "followUp" });
+          }
+        }
+
         return;
       }
 
