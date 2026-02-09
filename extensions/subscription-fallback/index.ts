@@ -68,6 +68,15 @@ interface Config {
   rateLimitPatterns?: string[];
 
   /**
+   * If true (default), and the session starts on the fallback provider, the extension will
+   * immediately try to switch back to a subscription provider.
+   *
+   * This prevents getting "stuck" in API mode across restarts when you don't currently have
+   * an API key configured.
+   */
+  preferPrimaryOnStartup?: boolean;
+
+  /**
    * Optional: rotate among multiple OpenAI accounts while using the fallback provider.
    * Only supported when fallbackProvider is "openai".
    */
@@ -114,6 +123,7 @@ function loadConfig(cwd: string): Config {
     cooldownMinutes: 180,
     autoRetry: true,
     rateLimitPatterns: [],
+    preferPrimaryOnStartup: true,
     fallbackAccountCooldownMinutes: 15,
     ...globalCfg,
     ...projectCfg,
@@ -132,6 +142,7 @@ function loadConfig(cwd: string): Config {
   merged.cooldownMinutes = merged.cooldownMinutes ?? 180;
   merged.autoRetry = merged.autoRetry ?? true;
   merged.rateLimitPatterns = merged.rateLimitPatterns ?? [];
+  merged.preferPrimaryOnStartup = merged.preferPrimaryOnStartup ?? true;
   merged.fallbackAccountCooldownMinutes = merged.fallbackAccountCooldownMinutes ?? 15;
   merged.fallbackAccounts = Array.isArray(merged.fallbackAccounts) ? merged.fallbackAccounts : undefined;
 
@@ -307,6 +318,10 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
 
   let lastCtx: any | undefined;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // One-shot startup behavior: if we start up in fallback mode, try to switch back to a
+  // subscription provider immediately.
+  let startupPreferPrimaryDone = false;
 
   // Track extension-driven switches so we don't treat them as user actions.
   let pendingExtensionSwitch:
@@ -825,6 +840,65 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     ctx.ui.setStatus(EXT, msg);
   }
 
+  async function maybePreferPrimaryOnStartup(ctx: any, reason: string): Promise<void> {
+    if (startupPreferPrimaryDone) return;
+
+    ensureCfg(ctx);
+
+    // If the extension is disabled, or startup behavior is disabled, never attempt.
+    if (!cfg?.enabled) {
+      startupPreferPrimaryDone = true;
+      return;
+    }
+    if (cfg.preferPrimaryOnStartup === false) {
+      startupPreferPrimaryDone = true;
+      return;
+    }
+
+    rememberActiveFromCtx(ctx);
+
+    const provider = activeProvider ?? ctx.model?.provider;
+    if (!provider) {
+      // We don't yet know what model/provider we restored. Try again when we do.
+      return;
+    }
+
+    if (isPrimaryProvider(provider)) {
+      startupPreferPrimaryDone = true;
+      return;
+    }
+
+    // Only interfere if we started on the configured fallback provider.
+    if (provider !== cfg.fallbackProvider) {
+      startupPreferPrimaryDone = true;
+      return;
+    }
+
+    managedModelId = managedModelId ?? resolveManagedModelId(ctx);
+    if (!managedModelId) {
+      // Can't switch without a model id that's present in both providers. We'll try again on
+      // model restore/select.
+      return;
+    }
+
+    const targetPrimary = selectBestPrimaryProvider() || primaryProviders[0];
+    if (!targetPrimary) {
+      startupPreferPrimaryDone = true;
+      return;
+    }
+
+    startupPreferPrimaryDone = true;
+
+    if (ctx.hasUI) {
+      ctx.ui.notify(
+        `[${EXT}] Startup: switching to subscription (${formatPrimaryProviderLabel(targetPrimary)})…`,
+        "info",
+      );
+    }
+
+    await switchToProvider(ctx, targetPrimary, `startup (${reason})`);
+  }
+
   function canManageModelId(ctx: any, modelId: string): boolean {
     const fallback = cfg?.fallbackProvider;
     if (!fallback) return false;
@@ -841,6 +915,24 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     return true;
   }
 
+  function selectAnyManageableModelId(ctx: any): string | undefined {
+    if (!cfg) return undefined;
+
+    const firstPrimary = primaryProviders[0];
+    if (!firstPrimary) return undefined;
+
+    const all = typeof ctx.modelRegistry?.getAll === "function" ? (ctx.modelRegistry.getAll() as any[]) : [];
+
+    for (const m of all) {
+      if (!m || m.provider !== firstPrimary) continue;
+      const id = String(m.id ?? "");
+      if (!id) continue;
+      if (canManageModelId(ctx, id)) return id;
+    }
+
+    return undefined;
+  }
+
   function resolveManagedModelId(ctx: any): string | undefined {
     if (!cfg) return undefined;
 
@@ -851,7 +943,8 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     const current = ctx.model;
     if (current?.id && canManageModelId(ctx, current.id)) return current.id;
 
-    return undefined;
+    // Last resort: pick *some* model id that exists in both providers.
+    return selectAnyManageableModelId(ctx);
   }
 
   async function switchToProvider(ctx: any, provider: string, reason: string): Promise<boolean> {
@@ -1100,6 +1193,8 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     ensureCfg(ctx);
     if (!cfg?.enabled) return;
 
+    await maybePreferPrimaryOnStartup(ctx, "before agent start");
+
     rememberActiveFromCtx(ctx);
 
     // If we're already on the fallback provider, make sure the selected account is applied.
@@ -1307,6 +1402,8 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     reloadCfg(ctx);
     managedModelId = resolveManagedModelId(ctx);
     rememberActiveFromCtx(ctx);
+
+    await maybePreferPrimaryOnStartup(ctx, "session start");
 
     // If the session starts on the fallback provider, make sure the selected account is applied.
     if (cfg?.enabled && (activeProvider ?? ctx.model?.provider) === cfg.fallbackProvider) {

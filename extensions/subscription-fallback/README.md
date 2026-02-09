@@ -71,11 +71,16 @@ Project-local values override global.
   "modelId": "gpt-5.2",
   "cooldownMinutes": 180,
   "autoRetry": true,
+  "preferPrimaryOnStartup": true,
   "rateLimitPatterns": [
     "You have hit your ChatGPT usage limit"
   ]
 }
 ```
+
+Notes:
+
+- `preferPrimaryOnStartup` (default: `true`): if pi restores your last model on the fallback provider (API-key mode), the extension will immediately try to switch back to a subscription provider on startup.
 
 ### Multiple ChatGPT OAuth accounts (subscription aliases)
 
