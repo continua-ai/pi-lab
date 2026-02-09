@@ -3,6 +3,7 @@
 Shows a small status icon in your terminal title:
 
 - `🟣` busy (agent running or follow-ups queued)
+- `🗜️` compacting (session is being compacted)
 - `✅` ready (idle)
 - `⬜` pending (session start or interrupted run)
 
