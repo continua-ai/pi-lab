@@ -6,8 +6,9 @@ It supports:
 
 - multiple vendors (v1: `openai`, `claude`)
 - multiple auth routes per vendor (`oauth`, `api_key`)
-- ordered failover (route order in config)
-- model policy `follow_current` (v1 only)
+- global failover preference stack (route + optional model override)
+- configurable failover triggers (`rate_limit`, `quota_exhausted`, `auth_error`)
+- automatic return to higher-preference routes after cooldown
 - an LLM-callable bridge tool: `subswitch_manage`
 
 ## Install
@@ -32,24 +33,40 @@ Config is loaded and merged in this order:
 1. Global: `~/.pi/agent/subswitch.json`
 2. Project: `./.pi/subswitch.json`
 
-Project entries override global entries by vendor.
+Project entries override global top-level keys; vendor entries are merged by vendor name.
 
 Backward compatibility:
 
 - If no `subswitch.json` exists, the extension will attempt to migrate legacy
   `subscription-fallback.json` shape (OpenAI-only) at runtime.
 
-## Config schema (v1)
+## Config schema (v2)
 
-- `vendors[].routes[]` order is the failover order.
-- `auth_type` is `oauth` or `api_key`.
-- `provider_id` is the underlying pi provider id.
+Key ideas:
+
+- `vendors[].routes[]` defines available routes/accounts.
+- `preference_stack[]` defines failover priority globally.
+- each stack entry can optionally pin a `model`; otherwise it follows the current model.
+- `failover.scope` controls whether failover can cross vendors.
+- triggers default to `true` when omitted.
 
 ```json
 {
   "enabled": true,
   "default_vendor": "openai",
   "rate_limit_patterns": [],
+  "failover": {
+    "scope": "global",
+    "return_to_preferred": {
+      "enabled": true,
+      "min_stable_minutes": 10
+    },
+    "triggers": {
+      "rate_limit": true,
+      "quota_exhausted": true,
+      "auth_error": true
+    }
+  },
   "vendors": [
     {
       "vendor": "openai",
@@ -57,21 +74,20 @@ Backward compatibility:
       "api_key_cooldown_minutes": 15,
       "auto_retry": true,
       "routes": [
-        { "auth_type": "oauth", "label": "work", "provider_id": "openai-codex-work" },
-        { "auth_type": "oauth", "label": "personal", "provider_id": "openai-codex" },
         {
+          "id": "openai-work-sub",
+          "auth_type": "oauth",
+          "label": "work",
+          "provider_id": "openai-codex-work"
+        },
+        {
+          "id": "openai-work-api",
           "auth_type": "api_key",
           "label": "work",
           "provider_id": "openai",
           "api_key_env": "OPENAI_API_KEY_WORK",
           "openai_org_id_env": "OPENAI_ORG_ID_WORK",
           "openai_project_id_env": "OPENAI_PROJECT_ID_WORK"
-        },
-        {
-          "auth_type": "api_key",
-          "label": "personal",
-          "provider_id": "openai",
-          "api_key_env": "OPENAI_API_KEY_PERSONAL"
         }
       ]
     },
@@ -81,16 +97,19 @@ Backward compatibility:
       "api_key_cooldown_minutes": 15,
       "auto_retry": true,
       "routes": [
-        { "auth_type": "oauth", "label": "personal", "provider_id": "anthropic" },
-        { "auth_type": "oauth", "label": "work", "provider_id": "anthropic-work" },
         {
-          "auth_type": "api_key",
+          "id": "claude-work-sub",
+          "auth_type": "oauth",
           "label": "work",
-          "provider_id": "anthropic-api",
-          "api_key_env": "ANTHROPIC_API_KEY_WORK"
+          "provider_id": "anthropic-work"
         }
       ]
     }
+  ],
+  "preference_stack": [
+    { "route_id": "openai-work-sub", "model": "gpt-5.2" },
+    { "route_id": "claude-work-sub", "model": "claude-sonnet-4-5" },
+    { "route_id": "openai-work-api", "model": "gpt-5.2" }
   ]
 }
 ```
@@ -106,7 +125,7 @@ All control is via `/subswitch`.
   - Show detailed status.
 
 - `/subswitch setup`
-  - Guided setup wizard (supports Back via `← Back` and `/back` on inputs, includes route-order step, and drives OAuth login checklist).
+  - Guided setup wizard (supports Back via `← Back` and `/back` on inputs, includes route order, failover policy/triggers, preference stack, and OAuth login checklist).
 
 - `/subswitch login`
   - Show OAuth login checklist and optionally prefill `/login`.
@@ -133,7 +152,7 @@ All control is via `/subswitch`.
   - Rename a route label and persist config.
 
 - `/subswitch reorder [vendor]`
-  - Interactive route reorder; persists config.
+  - Interactive failover preference-stack reorder (optionally filtered by vendor); persists config.
 
 - `/subswitch edit`
   - Edit JSON config with validation.
@@ -157,7 +176,7 @@ Supported actions:
 - `status`
 - `reload`
 - `use`
-- `prefer` (move route to front of failover order, then optionally switch)
+- `prefer` (move matching route entry to the top of failover preference stack, then optionally switch)
 - `rename`
 
 This allows natural-language requests like:
@@ -180,6 +199,8 @@ Use stable ids; changing ids usually requires re-login for that route.
 
 ## Notes
 
-- v1 model policy is `follow_current`: `/subswitch` follows whichever model you selected with `/model`.
-- Failover only happens when the current model exists on the candidate route.
-- Quota/rate-limit detection intentionally ignores context-window errors.
+- If a `preference_stack` entry has no `model`, subswitch follows the current `/model` selection for that entry.
+- If a `preference_stack` entry has a `model`, that model is used when that entry is selected.
+- `failover.scope=current_vendor` restricts failover/return to entries in the current vendor.
+- `auth_error` trigger is applied only to `api_key` routes.
+- Failover detection ignores context-window errors.

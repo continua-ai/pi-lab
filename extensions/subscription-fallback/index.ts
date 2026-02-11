@@ -3,8 +3,8 @@
 // v2 UX goals:
 // - support multiple vendors (openai, claude)
 // - support multiple auth routes per vendor (oauth + api_key)
-// - failover order is the order routes are defined in config
-// - model policy is always "follow_current" in v1 (no pinned model)
+// - failover order is defined by a global preference stack (route + optional model)
+// - model policy defaults to "follow_current", with optional per-stack-entry model override
 // - expose a command UX + LLM-callable tool bridge
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -23,10 +23,37 @@ import { Type } from "@sinclair/typebox";
 
 type InputSource = "interactive" | "rpc" | "extension";
 type AuthType = "oauth" | "api_key";
+type FailoverScope = "global" | "current_vendor";
 
 const EXT = "subscription-fallback";
 
+interface PreferenceStackEntryConfig {
+  route_id?: string;
+  model?: string;
+}
+
+interface FailoverReturnConfig {
+  enabled?: boolean;
+  min_stable_minutes?: number;
+}
+
+interface FailoverTriggersConfig {
+  rate_limit?: boolean;
+  quota_exhausted?: boolean;
+  auth_error?: boolean;
+}
+
+interface FailoverConfig {
+  scope?: FailoverScope;
+  return_to_preferred?: FailoverReturnConfig;
+  // Legacy aliases accepted for compatibility.
+  auto_return?: boolean;
+  min_stable_minutes?: number;
+  triggers?: FailoverTriggersConfig;
+}
+
 interface RouteConfig {
+  id?: string;
   auth_type?: AuthType;
   label?: string;
   provider_id?: string;
@@ -59,9 +86,12 @@ interface Config {
   default_vendor?: string;
   vendors?: VendorConfig[];
   rate_limit_patterns?: string[];
+  failover?: FailoverConfig;
+  preference_stack?: PreferenceStackEntryConfig[];
 }
 
 interface NormalizedRoute {
+  id: string;
   auth_type: AuthType;
   label: string;
   provider_id: string;
@@ -81,11 +111,48 @@ interface NormalizedVendor {
   auto_retry: boolean;
 }
 
+interface NormalizedPreferenceStackEntry {
+  route_id: string;
+  model?: string;
+}
+
+interface NormalizedFailoverReturnConfig {
+  enabled: boolean;
+  min_stable_minutes: number;
+}
+
+interface NormalizedFailoverTriggersConfig {
+  rate_limit: boolean;
+  quota_exhausted: boolean;
+  auth_error: boolean;
+}
+
+interface NormalizedFailoverConfig {
+  scope: FailoverScope;
+  return_to_preferred: NormalizedFailoverReturnConfig;
+  triggers: NormalizedFailoverTriggersConfig;
+}
+
 interface NormalizedConfig {
   enabled: boolean;
   default_vendor: string;
   vendors: NormalizedVendor[];
   rate_limit_patterns: string[];
+  failover: NormalizedFailoverConfig;
+  preference_stack: NormalizedPreferenceStackEntry[];
+}
+
+interface ResolvedRouteRef {
+  vendor: string;
+  index: number;
+  route: NormalizedRoute;
+}
+
+interface EffectivePreferenceEntry {
+  stack_index: number;
+  route_ref: ResolvedRouteRef;
+  model_id: string;
+  model_source: "entry" | "current";
 }
 
 // Legacy schema from v1 (OpenAI-only)
@@ -247,7 +314,26 @@ function mergeVendorLists(globalVendors: VendorConfig[] | undefined, projectVend
   return out;
 }
 
-function normalizeRoute(vendor: string, route: RouteConfig, index: number): NormalizedRoute | undefined {
+function uniqueRouteId(base: string, usedIds: Set<string>): string {
+  const cleaned = (base || "").trim().replace(/\s+/g, "-") || "route";
+  if (!usedIds.has(cleaned)) {
+    usedIds.add(cleaned);
+    return cleaned;
+  }
+
+  let n = 2;
+  while (usedIds.has(`${cleaned}-${n}`)) n += 1;
+  const id = `${cleaned}-${n}`;
+  usedIds.add(id);
+  return id;
+}
+
+function normalizeRoute(
+  vendor: string,
+  route: RouteConfig,
+  index: number,
+  usedIds: Set<string>,
+): NormalizedRoute | undefined {
   const authType: AuthType = route.auth_type === "oauth" || route.auth_type === "api_key" ? route.auth_type : "oauth";
 
   const providerId = String(route.provider_id ?? defaultProviderId(vendor, authType)).trim();
@@ -255,8 +341,11 @@ function normalizeRoute(vendor: string, route: RouteConfig, index: number): Norm
 
   const fallbackLabel = `${authType}-${index + 1}`;
   const label = String(route.label ?? fallbackLabel).trim() || fallbackLabel;
+  const rawRouteId = String(route.id ?? `${vendor}-${authType}-${label}`).trim();
+  const routeId = uniqueRouteId(rawRouteId, usedIds);
 
   const out: NormalizedRoute = {
+    id: routeId,
     auth_type: authType,
     label,
     provider_id: providerId,
@@ -277,10 +366,116 @@ function normalizeRoute(vendor: string, route: RouteConfig, index: number): Norm
   return out;
 }
 
+function normalizeFailover(raw: FailoverConfig | undefined): NormalizedFailoverConfig {
+  const scope: FailoverScope = raw?.scope === "current_vendor" ? "current_vendor" : "global";
+
+  const returnEnabled = raw?.return_to_preferred?.enabled ?? raw?.auto_return ?? true;
+  const minStableMinutesRaw =
+    raw?.return_to_preferred?.min_stable_minutes ?? raw?.min_stable_minutes ?? 10;
+  const minStableMinutes = Number.isFinite(Number(minStableMinutesRaw))
+    ? Math.max(0, Math.floor(Number(minStableMinutesRaw)))
+    : 10;
+
+  return {
+    scope,
+    return_to_preferred: {
+      enabled: Boolean(returnEnabled),
+      min_stable_minutes: minStableMinutes,
+    },
+    triggers: {
+      rate_limit: raw?.triggers?.rate_limit ?? true,
+      quota_exhausted: raw?.triggers?.quota_exhausted ?? true,
+      auth_error: raw?.triggers?.auth_error ?? true,
+    },
+  };
+}
+
+function buildDefaultPreferenceStack(
+  vendors: NormalizedVendor[],
+  defaultVendor: string,
+): NormalizedPreferenceStackEntry[] {
+  const vendorOrder: string[] = [];
+  if (vendors.some((v) => v.vendor === defaultVendor)) {
+    vendorOrder.push(defaultVendor);
+  }
+  for (const v of vendors) {
+    if (!vendorOrder.includes(v.vendor)) vendorOrder.push(v.vendor);
+  }
+
+  const byVendor = new Map<string, NormalizedVendor>();
+  for (const v of vendors) byVendor.set(v.vendor, v);
+
+  const out: NormalizedPreferenceStackEntry[] = [];
+  const pushByAuth = (authType: AuthType): void => {
+    for (const vendor of vendorOrder) {
+      const v = byVendor.get(vendor);
+      if (!v) continue;
+      for (const route of v.routes) {
+        if (route.auth_type !== authType) continue;
+        out.push({ route_id: route.id });
+      }
+    }
+  };
+
+  // Recommended default: subscription first, then API key routes.
+  pushByAuth("oauth");
+  pushByAuth("api_key");
+
+  if (out.length === 0) {
+    for (const v of vendors) {
+      for (const route of v.routes) {
+        out.push({ route_id: route.id });
+      }
+    }
+  }
+
+  return out;
+}
+
+function normalizePreferenceStack(
+  inputEntries: PreferenceStackEntryConfig[] | undefined,
+  vendors: NormalizedVendor[],
+  defaultVendor: string,
+): NormalizedPreferenceStackEntry[] {
+  const routeIds = new Set<string>();
+  for (const v of vendors) {
+    for (const route of v.routes) routeIds.add(route.id);
+  }
+
+  const out: NormalizedPreferenceStackEntry[] = [];
+  const seen = new Set<string>();
+  const raw = Array.isArray(inputEntries) ? inputEntries : [];
+  for (const entry of raw) {
+    const routeId = String(entry?.route_id ?? "").trim();
+    if (!routeId || !routeIds.has(routeId)) continue;
+
+    const model = String(entry?.model ?? "").trim() || undefined;
+    const key = `${routeId}::${model ?? ""}`;
+    if (seen.has(key)) continue;
+
+    out.push({ route_id: routeId, ...(model ? { model } : {}) });
+    seen.add(key);
+  }
+
+  const recommended = buildDefaultPreferenceStack(vendors, defaultVendor);
+  if (out.length === 0) return recommended;
+
+  // Ensure every configured route appears at least once in the stack.
+  const presentRouteIds = new Set(out.map((entry) => entry.route_id));
+  for (const entry of recommended) {
+    if (presentRouteIds.has(entry.route_id)) continue;
+    out.push(entry);
+    presentRouteIds.add(entry.route_id);
+  }
+
+  return out;
+}
+
 function normalizeConfig(input: Config | undefined): NormalizedConfig {
   const vendorsInput = Array.isArray(input?.vendors) ? input?.vendors : [];
 
   const vendors: NormalizedVendor[] = [];
+  const usedRouteIds = new Set<string>();
   for (const rawVendor of vendorsInput) {
     const vendorName = String(rawVendor.vendor ?? "").trim().toLowerCase();
     if (!vendorName) continue;
@@ -288,7 +483,7 @@ function normalizeConfig(input: Config | undefined): NormalizedConfig {
     const rawRoutes = Array.isArray(rawVendor.routes) ? rawVendor.routes : [];
     const routes: NormalizedRoute[] = [];
     for (let i = 0; i < rawRoutes.length; i++) {
-      const normalized = normalizeRoute(vendorName, rawRoutes[i], i);
+      const normalized = normalizeRoute(vendorName, rawRoutes[i], i, usedRouteIds);
       if (normalized) routes.push(normalized);
     }
 
@@ -311,19 +506,27 @@ function normalizeConfig(input: Config | undefined): NormalizedConfig {
     });
   }
 
-  const defaultVendor = String(input?.default_vendor ?? vendors[0]?.vendor ?? "openai")
+  let defaultVendor = String(input?.default_vendor ?? vendors[0]?.vendor ?? "openai")
     .trim()
     .toLowerCase();
+  if (vendors.length > 0 && !vendors.some((v) => v.vendor === defaultVendor)) {
+    defaultVendor = vendors[0].vendor;
+  }
 
   const rateLimitPatterns = Array.isArray(input?.rate_limit_patterns)
     ? input?.rate_limit_patterns.map((p) => String(p).trim()).filter(Boolean)
     : [];
+
+  const failover = normalizeFailover(input?.failover);
+  const preferenceStack = normalizePreferenceStack(input?.preference_stack, vendors, defaultVendor);
 
   return {
     enabled: input?.enabled ?? true,
     default_vendor: defaultVendor,
     vendors,
     rate_limit_patterns: rateLimitPatterns,
+    failover,
+    preference_stack: preferenceStack,
   };
 }
 
@@ -478,12 +681,29 @@ function configToJson(cfg: NormalizedConfig): Config {
     enabled: cfg.enabled,
     default_vendor: cfg.default_vendor,
     rate_limit_patterns: cfg.rate_limit_patterns,
+    failover: {
+      scope: cfg.failover.scope,
+      return_to_preferred: {
+        enabled: cfg.failover.return_to_preferred.enabled,
+        min_stable_minutes: cfg.failover.return_to_preferred.min_stable_minutes,
+      },
+      triggers: {
+        rate_limit: cfg.failover.triggers.rate_limit,
+        quota_exhausted: cfg.failover.triggers.quota_exhausted,
+        auth_error: cfg.failover.triggers.auth_error,
+      },
+    },
+    preference_stack: cfg.preference_stack.map((entry) => ({
+      route_id: entry.route_id,
+      model: entry.model,
+    })),
     vendors: cfg.vendors.map((v) => ({
       vendor: v.vendor,
       oauth_cooldown_minutes: v.oauth_cooldown_minutes,
       api_key_cooldown_minutes: v.api_key_cooldown_minutes,
       auto_retry: v.auto_retry,
       routes: v.routes.map((r) => ({
+        id: r.id,
         auth_type: r.auth_type,
         label: r.label,
         provider_id: r.provider_id,
@@ -536,7 +756,25 @@ function isContextWindowExceededError(err: unknown): boolean {
   return patterns.some((p) => p && l.includes(p));
 }
 
-function isRateLimitError(err: unknown, extraPatterns: string[] = []): boolean {
+function isQuotaExhaustedError(err: unknown): boolean {
+  if (isContextWindowExceededError(err)) return false;
+
+  const s = String(err ?? "");
+  const l = s.toLowerCase();
+
+  const patterns = [
+    "insufficient_quota",
+    "quota exceeded",
+    "exceeded your current quota",
+    "billing hard limit",
+    "credit balance",
+    "out of credits",
+  ];
+
+  return patterns.some((p) => p && l.includes(p));
+}
+
+function isRateLimitSignalError(err: unknown, extraPatterns: string[] = []): boolean {
   if (isContextWindowExceededError(err)) return false;
 
   const s = String(err ?? "");
@@ -551,12 +789,31 @@ function isRateLimitError(err: unknown, extraPatterns: string[] = []): boolean {
     "please try again",
     "usage limit",
     "usage_limit",
-    "insufficient_quota",
-    "quota exceeded",
-    "exceeded your current quota",
-    "billing hard limit",
     "capacity",
     ...extraPatterns.map((p) => p.toLowerCase()),
+  ];
+
+  return patterns.some((p) => p && l.includes(p));
+}
+
+function isAuthError(err: unknown): boolean {
+  if (isContextWindowExceededError(err)) return false;
+
+  const s = String(err ?? "");
+  const l = s.toLowerCase();
+
+  const patterns = [
+    "invalid api key",
+    "incorrect api key",
+    "api key is not valid",
+    "authentication",
+    "unauthorized",
+    "forbidden",
+    "permission denied",
+    "401",
+    "403",
+    "invalid x-api-key",
+    "missing api key",
   ];
 
   return patterns.some((p) => p && l.includes(p));
@@ -657,7 +914,7 @@ export default function (pi: ExtensionAPI): void {
   let lastPrompt: LastPrompt | undefined;
   let pendingInputSource: InputSource | undefined;
 
-  // follow_current model policy
+  // Current model selected by /model (used when preference stack entries omit model).
   let managedModelId: string | undefined;
 
   // Current route state
@@ -680,6 +937,9 @@ export default function (pi: ExtensionAPI): void {
 
   const LOGIN_WIDGET_KEY = `${EXT}-oauth-login`;
   let pendingOauthReminderProviders: string[] = [];
+
+  // Prevent immediate bounce-backs after failover.
+  let nextReturnEligibleAtMs = 0;
 
   function routeKey(vendor: string, index: number): string {
     return `${vendor}::${index}`;
@@ -713,6 +973,21 @@ export default function (pi: ExtensionAPI): void {
     if (!v) return undefined;
     if (index < 0 || index >= v.routes.length) return undefined;
     return v.routes[index];
+  }
+
+  function resolveRouteById(routeId: string): ResolvedRouteRef | undefined {
+    if (!cfg) return undefined;
+    const id = routeId.trim();
+    if (!id) return undefined;
+
+    for (const v of cfg.vendors) {
+      for (let i = 0; i < v.routes.length; i++) {
+        if (v.routes[i].id === id) {
+          return { vendor: v.vendor, index: i, route: v.routes[i] };
+        }
+      }
+    }
+    return undefined;
   }
 
   function captureOriginalEnv(): void {
@@ -851,32 +1126,56 @@ export default function (pi: ExtensionAPI): void {
     return true;
   }
 
-  function selectBestRouteIndex(ctx: any, vendor: string, modelId: string): number | undefined {
-    const v = getVendor(vendor);
-    if (!v) return undefined;
-    for (let i = 0; i < v.routes.length; i++) {
-      if (routeEligible(ctx, vendor, i, modelId)) return i;
-    }
-    return undefined;
+  function routeEligibleRef(ctx: any, ref: ResolvedRouteRef, modelId: string): boolean {
+    return routeEligible(ctx, ref.vendor, ref.index, modelId);
   }
 
-  function selectNextRouteIndexForFailover(
-    ctx: any,
-    vendor: string,
-    modelId: string,
-    currentIndex: number,
-  ): number | undefined {
-    const v = getVendor(vendor);
-    if (!v) return undefined;
-    if (v.routes.length <= 1) return undefined;
+  function buildEffectivePreferenceStack(
+    currentVendor: string | undefined,
+    currentModelId: string | undefined,
+  ): EffectivePreferenceEntry[] {
+    if (!cfg) return [];
 
-    for (let offset = 1; offset < v.routes.length; offset++) {
-      const idx = (currentIndex + offset) % v.routes.length;
-      if (idx === currentIndex) continue;
-      if (routeEligible(ctx, vendor, idx, modelId)) return idx;
+    const effective: EffectivePreferenceEntry[] = [];
+    for (let i = 0; i < cfg.preference_stack.length; i++) {
+      const entry = cfg.preference_stack[i];
+      const routeRef = resolveRouteById(entry.route_id);
+      if (!routeRef) continue;
+
+      if (
+        cfg.failover.scope === "current_vendor" &&
+        currentVendor &&
+        routeRef.vendor !== currentVendor
+      ) {
+        continue;
+      }
+
+      const modelId = entry.model ?? currentModelId;
+      if (!modelId) continue;
+
+      effective.push({
+        stack_index: i,
+        route_ref: routeRef,
+        model_id: modelId,
+        model_source: entry.model ? "entry" : "current",
+      });
     }
 
-    return undefined;
+    return effective;
+  }
+
+  function findCurrentEffectiveStackIndex(
+    effective: EffectivePreferenceEntry[],
+    currentRouteId: string,
+    currentModelId: string,
+  ): number | undefined {
+    const exact = effective.findIndex(
+      (entry) => entry.route_ref.route.id === currentRouteId && entry.model_id === currentModelId,
+    );
+    if (exact >= 0) return exact;
+
+    const routeOnly = effective.findIndex((entry) => entry.route_ref.route.id === currentRouteId);
+    return routeOnly >= 0 ? routeOnly : undefined;
   }
 
   function clearRetryTimer(): void {
@@ -886,46 +1185,65 @@ export default function (pi: ExtensionAPI): void {
     }
   }
 
-  function computeNextCooldownExpiry(): number | undefined {
+  function computeNextRecoveryEvent(): number | undefined {
     let next: number | undefined;
+
     for (const until of routeCooldownUntil.values()) {
       if (!until || until <= now()) continue;
       if (!next || until < next) next = until;
     }
+
+    if (cfg?.failover.return_to_preferred.enabled && nextReturnEligibleAtMs > now()) {
+      if (!next || nextReturnEligibleAtMs < next) next = nextReturnEligibleAtMs;
+    }
+
     return next;
   }
 
   async function maybePromotePreferredRoute(ctx: any, reason: string): Promise<void> {
     if (!cfg?.enabled) return;
+    if (!cfg.failover.return_to_preferred.enabled) return;
     if (!ctx.model?.id || !ctx.model?.provider) return;
+    if (nextReturnEligibleAtMs > now()) return;
 
     const resolved = resolveVendorRouteForProvider(ctx.model.provider);
     if (!resolved) return;
 
-    const { vendor, index: currentIndex } = resolved;
-    const modelId = ctx.model.id;
+    const currentRoute = getRoute(resolved.vendor, resolved.index);
+    if (!currentRoute) return;
 
-    const bestIdx = selectBestRouteIndex(ctx, vendor, modelId);
-    if (bestIdx === undefined) return;
+    const currentModelId = ctx.model.id;
+    const effective = buildEffectivePreferenceStack(resolved.vendor, currentModelId);
+    if (effective.length === 0) return;
 
-    if (bestIdx < currentIndex) {
-      if (ctx.hasUI) {
-        const route = getRoute(vendor, bestIdx);
-        if (route) {
-          ctx.ui.notify(
-            `[${EXT}] Cooldown expired; switching back to preferred route (${routeDisplay(vendor, route)})…`,
-            "info",
-          );
-        }
-      }
-      await switchToRoute(ctx, vendor, bestIdx, modelId, reason, true);
+    const currentIdx = findCurrentEffectiveStackIndex(effective, currentRoute.id, currentModelId);
+    const bestIdx = effective.findIndex((entry) => routeEligibleRef(ctx, entry.route_ref, entry.model_id));
+    if (bestIdx < 0) return;
+
+    if (currentIdx !== undefined && bestIdx >= currentIdx) return;
+
+    const target = effective[bestIdx];
+    if (ctx.hasUI) {
+      ctx.ui.notify(
+        `[${EXT}] Recovering preferred route: ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})`,
+        "info",
+      );
     }
+
+    await switchToRoute(
+      ctx,
+      target.route_ref.vendor,
+      target.route_ref.index,
+      target.model_id,
+      reason,
+      true,
+    );
   }
 
   function scheduleRetryTimer(ctx: any): void {
     clearRetryTimer();
 
-    const next = computeNextCooldownExpiry();
+    const next = computeNextRecoveryEvent();
     if (!next) return;
 
     const delay = Math.max(1000, next - now());
@@ -1120,13 +1438,21 @@ export default function (pi: ExtensionAPI): void {
     activeRouteIndexByVendor.set(resolved.vendor, resolved.index);
   }
 
-  function nearestPreferredCooldownHint(vendor: string, currentIndex: number): string | undefined {
-    const v = getVendor(vendor);
-    if (!v) return undefined;
+  function nearestPreferredCooldownHint(
+    currentVendor: string,
+    currentRouteId: string,
+    currentModelId: string,
+  ): string | undefined {
+    const effective = buildEffectivePreferenceStack(currentVendor, currentModelId);
+    if (effective.length === 0) return undefined;
+
+    const currentIdx = findCurrentEffectiveStackIndex(effective, currentRouteId, currentModelId);
+    if (currentIdx === undefined || currentIdx <= 0) return undefined;
 
     let nearestUntil: number | undefined;
-    for (let i = 0; i < currentIndex; i++) {
-      const until = getRouteCooldownUntil(vendor, i);
+    for (let i = 0; i < currentIdx; i++) {
+      const candidate = effective[i];
+      const until = getRouteCooldownUntil(candidate.route_ref.vendor, candidate.route_ref.index);
       if (!until || until <= now()) continue;
       if (!nearestUntil || until < nearestUntil) nearestUntil = until;
     }
@@ -1134,7 +1460,7 @@ export default function (pi: ExtensionAPI): void {
     if (!nearestUntil) return undefined;
 
     const mins = Math.max(0, Math.ceil((nearestUntil - now()) / 60000));
-    return `preferred route retry ~${mins}m`;
+    return `preferred retry ~${mins}m`;
   }
 
   function updateStatus(ctx: any): void {
@@ -1169,7 +1495,7 @@ export default function (pi: ExtensionAPI): void {
     msg += " " + ctx.ui.theme.fg("dim", `${resolved.vendor}/${route.label}`);
     msg += " " + ctx.ui.theme.fg("dim", modelId);
 
-    const hint = nearestPreferredCooldownHint(resolved.vendor, resolved.index);
+    const hint = nearestPreferredCooldownHint(resolved.vendor, route.id, modelId);
     if (hint) msg += " " + ctx.ui.theme.fg("dim", `(${hint})`);
 
     ctx.ui.setStatus(EXT, msg);
@@ -1180,11 +1506,37 @@ export default function (pi: ExtensionAPI): void {
 
     const lines: string[] = [];
     lines.push(`[${EXT}] enabled=${cfg.enabled} default_vendor=${cfg.default_vendor}`);
+    lines.push(
+      `failover scope=${cfg.failover.scope} return_to_preferred=${cfg.failover.return_to_preferred.enabled} stable=${cfg.failover.return_to_preferred.min_stable_minutes}m triggers(rate_limit=${cfg.failover.triggers.rate_limit},quota=${cfg.failover.triggers.quota_exhausted},auth=${cfg.failover.triggers.auth_error})`,
+    );
+
+    if (nextReturnEligibleAtMs > now()) {
+      const mins = Math.max(0, Math.ceil((nextReturnEligibleAtMs - now()) / 60000));
+      lines.push(`return_holdoff~${mins}m`);
+    }
 
     const currentProvider = ctx.model?.provider;
     const currentModel = ctx.model?.id;
     if (currentProvider && currentModel) {
       lines.push(`current_model=${currentProvider}/${currentModel}`);
+    }
+
+    lines.push("preference_stack:");
+    for (let i = 0; i < cfg.preference_stack.length; i++) {
+      const entry = cfg.preference_stack[i];
+      const ref = resolveRouteById(entry.route_id);
+      if (!ref) {
+        lines.push(`  ${i + 1}. [missing route_id=${entry.route_id}]`);
+        continue;
+      }
+
+      const cooling = isRouteCoolingDown(ref.vendor, ref.index)
+        ? `cooldown~${Math.max(0, Math.ceil((getRouteCooldownUntil(ref.vendor, ref.index) - now()) / 60000))}m`
+        : "ready";
+      const model = entry.model ? ` model=${entry.model}` : " model=<follow_current>";
+      lines.push(
+        `  ${i + 1}. ${routeDisplay(ref.vendor, ref.route)} (id=${ref.route.id},${model}, ${cooling})`,
+      );
     }
 
     for (const v of cfg.vendors) {
@@ -1196,7 +1548,7 @@ export default function (pi: ExtensionAPI): void {
           ? `cooldown~${Math.max(0, Math.ceil((getRouteCooldownUntil(v.vendor, i) - now()) / 60000))}m`
           : "ready";
         lines.push(
-          `  ${active} ${i + 1}. ${route.auth_type} ${decode(route.label)} (provider=${route.provider_id}, ${cooling})`,
+          `  ${active} ${i + 1}. ${route.auth_type} ${decode(route.label)} (id=${route.id}, provider=${route.provider_id}, ${cooling})`,
         );
       }
     }
@@ -1206,9 +1558,7 @@ export default function (pi: ExtensionAPI): void {
 
   function notifyStatus(ctx: any): void {
     if (!ctx.hasUI) return;
-    for (const line of buildStatusLines(ctx)) {
-      ctx.ui.notify(line, "info");
-    }
+    ctx.ui.notify(buildStatusLines(ctx).join("\n"), "info");
   }
 
   function configuredOauthProviders(): string[] {
@@ -1500,7 +1850,7 @@ export default function (pi: ExtensionAPI): void {
 
   function routeOrderMoveToFront(vendor: string, authType: AuthType, label: string): boolean {
     const v = getVendor(vendor);
-    if (!v) return false;
+    if (!v || !cfg) return false;
 
     const idx = findRouteIndex(vendor, authType, label);
     if (idx === undefined) return false;
@@ -1517,6 +1867,11 @@ export default function (pi: ExtensionAPI): void {
         activeRouteIndexByVendor.set(vendor, current + 1);
       }
     }
+
+    // Keep preference stack aligned with explicit route preference operations.
+    const matching = cfg.preference_stack.filter((entry) => entry.route_id === picked.id);
+    const rest = cfg.preference_stack.filter((entry) => entry.route_id !== picked.id);
+    cfg.preference_stack = matching.length > 0 ? [...matching, ...rest] : [{ route_id: picked.id }, ...rest];
 
     return true;
   }
@@ -1595,42 +1950,50 @@ export default function (pi: ExtensionAPI): void {
 
   async function reorderVendorInteractive(ctx: any, vendorArg?: string): Promise<void> {
     ensureCfg(ctx);
-    if (!ctx.hasUI) {
+    if (!ctx.hasUI || !cfg) {
       return;
     }
 
-    const vendor = vendorForCommand(ctx, vendorArg);
-    const v = getVendor(vendor);
-    if (!v) {
-      ctx.ui.notify(`[${EXT}] Unknown vendor '${vendor}'`, "warning");
+    const filterVendor = vendorArg ? vendorForCommand(ctx, vendorArg) : undefined;
+
+    const indexed = cfg.preference_stack
+      .map((entry, index) => ({ index, entry, ref: resolveRouteById(entry.route_id) }))
+      .filter((x) => Boolean(x.ref))
+      .filter((x) => !filterVendor || x.ref!.vendor === filterVendor);
+
+    if (indexed.length < 2) {
+      const scope = filterVendor ? `for vendor '${filterVendor}'` : "";
+      ctx.ui.notify(`[${EXT}] Need at least 2 stack entries ${scope} to reorder`, "warning");
       return;
     }
 
-    if (v.routes.length < 2) {
-      ctx.ui.notify(`[${EXT}] Vendor '${vendor}' has fewer than 2 routes`, "warning");
-      return;
-    }
+    const labels = indexed.map((x, i) => {
+      const ref = x.ref!;
+      const model = x.entry.model ?? "<follow_current>";
+      return `${i + 1}. ${routeDisplay(ref.vendor, ref.route)} model=${model}`;
+    });
 
-    const fromChoices = v.routes.map((r, i) => `${i + 1}. ${routeDisplay(vendor, r)}`);
-    const from = await ctx.ui.select(`Move which route? (${vendor})`, fromChoices);
-    if (!from) return;
+    const fromChoice = await ctx.ui.select("Move which preference stack entry?", labels);
+    if (!fromChoice) return;
 
-    const fromIndex = fromChoices.indexOf(from);
-    if (fromIndex < 0) return;
+    const fromLocal = labels.indexOf(fromChoice);
+    if (fromLocal < 0) return;
 
-    const toChoices = v.routes.map((r, i) => `Position ${i + 1}: ${routeDisplay(vendor, r)}`);
-    const to = await ctx.ui.select(`Move to which position? (${vendor})`, toChoices);
-    if (!to) return;
+    const toChoice = await ctx.ui.select("Move to which position?", labels);
+    if (!toChoice) return;
 
-    const toIndex = toChoices.indexOf(to);
-    if (toIndex < 0 || toIndex === fromIndex) return;
+    const toLocal = labels.indexOf(toChoice);
+    if (toLocal < 0 || toLocal === fromLocal) return;
 
-    const [picked] = v.routes.splice(fromIndex, 1);
-    v.routes.splice(toIndex, 0, picked);
+    const fromGlobal = indexed[fromLocal].index;
+    const toGlobal = indexed[toLocal].index;
+
+    const [picked] = cfg.preference_stack.splice(fromGlobal, 1);
+    cfg.preference_stack.splice(toGlobal, 0, picked);
 
     const savePath = saveCurrentConfig(ctx);
     ctx.ui.notify(
-      `[${EXT}] Reordered routes for '${vendor}'. Saved to ${savePath}`,
+      `[${EXT}] Reordered preference stack${filterVendor ? ` for '${filterVendor}'` : ""}. Saved to ${savePath}`,
       "info",
     );
 
@@ -1734,10 +2097,17 @@ export default function (pi: ExtensionAPI): void {
           .join(", ") || "work";
 
       const existingApiEnvByLabel = new Map<string, string>();
+      const existingRouteIdByKey = new Map<string, string>();
       for (const route of existingRoutes) {
-        if (route.auth_type !== "api_key") continue;
+        const authType = route.auth_type === "api_key" ? "api_key" : "oauth";
         const label = String(route.label ?? "").trim();
         if (!label) continue;
+
+        if (route.id && String(route.id).trim()) {
+          existingRouteIdByKey.set(`${authType}::${label.toLowerCase()}`, String(route.id).trim());
+        }
+
+        if (route.auth_type !== "api_key") continue;
         if (route.api_key_env && String(route.api_key_env).trim()) {
           existingApiEnvByLabel.set(label, String(route.api_key_env).trim());
         }
@@ -1809,7 +2179,9 @@ export default function (pi: ExtensionAPI): void {
           const routes: RouteConfig[] = [];
 
           for (const label of oauthLabels) {
+            const key = `oauth::${label.toLowerCase()}`;
             routes.push({
+              id: existingRouteIdByKey.get(key),
               auth_type: "oauth",
               label,
               provider_id: generateOauthProviderId(vendor, label),
@@ -1817,7 +2189,9 @@ export default function (pi: ExtensionAPI): void {
           }
 
           for (const label of apiLabels) {
+            const key = `api_key::${label.toLowerCase()}`;
             routes.push({
+              id: existingRouteIdByKey.get(key),
               auth_type: "api_key",
               label,
               provider_id: defaultProviderId(vendor, "api_key"),
@@ -1864,7 +2238,7 @@ export default function (pi: ExtensionAPI): void {
           .join("\n");
 
         const orderChoice = await ctx.ui.select(
-          `${vendorTitle} route order (first = preferred failover):\n${summary}`,
+          `${vendorTitle} route order (first = preferred within vendor):\n${summary}`,
           ["Keep order", "Move route", "← Back", "Cancel"],
         );
 
@@ -1920,6 +2294,7 @@ export default function (pi: ExtensionAPI): void {
       vendorConfigs.set("openai", {
         vendor: "openai",
         routes: existingOpenAI.routes.map((r) => ({
+          id: r.id,
           auth_type: r.auth_type,
           label: r.label,
           provider_id: r.provider_id,
@@ -1941,6 +2316,7 @@ export default function (pi: ExtensionAPI): void {
       vendorConfigs.set("claude", {
         vendor: "claude",
         routes: existingClaude.routes.map((r) => ({
+          id: r.id,
           auth_type: r.auth_type,
           label: r.label,
           provider_id: r.provider_id,
@@ -1955,7 +2331,165 @@ export default function (pi: ExtensionAPI): void {
       });
     }
 
-    let stage: "dest" | "vendors" | "routes" | "order" | "default" = "dest";
+    let defaultVendorChoice = existingCfg.default_vendor;
+    let failoverScope: FailoverScope = existingCfg.failover.scope;
+    let returnEnabled = existingCfg.failover.return_to_preferred.enabled;
+    let returnStableMinutes = existingCfg.failover.return_to_preferred.min_stable_minutes;
+    let triggerRateLimit = existingCfg.failover.triggers.rate_limit;
+    let triggerQuota = existingCfg.failover.triggers.quota_exhausted;
+    let triggerAuth = existingCfg.failover.triggers.auth_error;
+    let preferenceStackDraft: PreferenceStackEntryConfig[] = existingCfg.preference_stack.map((entry) => ({
+      route_id: entry.route_id,
+      model: entry.model,
+    }));
+
+    function draftVendorList(): VendorConfig[] {
+      return Array.from(vendorConfigs.values());
+    }
+
+    function buildDraftNormalized(defaultVendor: string): NormalizedConfig {
+      return normalizeConfig({
+        enabled: true,
+        default_vendor: defaultVendor,
+        vendors: draftVendorList(),
+        rate_limit_patterns: cfg?.rate_limit_patterns ?? [],
+        failover: {
+          scope: failoverScope,
+          return_to_preferred: {
+            enabled: returnEnabled,
+            min_stable_minutes: returnStableMinutes,
+          },
+          triggers: {
+            rate_limit: triggerRateLimit,
+            quota_exhausted: triggerQuota,
+            auth_error: triggerAuth,
+          },
+        },
+        preference_stack: preferenceStackDraft,
+      });
+    }
+
+    function previewRouteLabel(preview: NormalizedConfig, routeId: string): string {
+      for (const v of preview.vendors) {
+        for (const route of v.routes) {
+          if (route.id === routeId) {
+            return `${routeDisplay(v.vendor, route)} [${route.id}]`;
+          }
+        }
+      }
+      return `[missing route_id=${routeId}]`;
+    }
+
+    async function configurePreferenceStack(defaultVendor: string): Promise<WizardNav> {
+      while (true) {
+        const preview = buildDraftNormalized(defaultVendor);
+        preferenceStackDraft = preview.preference_stack.map((entry) => ({
+          route_id: entry.route_id,
+          model: entry.model,
+        }));
+
+        const summary = preview.preference_stack
+          .map(
+            (entry, i) =>
+              `${i + 1}. ${previewRouteLabel(preview, entry.route_id)} model=${entry.model ?? "<follow_current>"}`,
+          )
+          .join("\n");
+
+        const choice = await ctx.ui.select(
+          `Preference stack (top is most preferred):\n${summary}`,
+          [
+            "Keep stack",
+            "Move entry",
+            "Set model override",
+            "Reset recommended",
+            "← Back",
+            "Cancel",
+          ],
+        );
+
+        if (!choice || choice === "Cancel") return "cancel";
+        if (choice === "← Back") return "back";
+        if (choice === "Keep stack") return "ok";
+
+        if (choice === "Reset recommended") {
+          preferenceStackDraft = [];
+          continue;
+        }
+
+        const entryOptions = preview.preference_stack.map(
+          (entry, i) =>
+            `${i + 1}. ${previewRouteLabel(preview, entry.route_id)} model=${entry.model ?? "<follow_current>"}`,
+        );
+
+        if (choice === "Move entry") {
+          if (entryOptions.length < 2) {
+            ctx.ui.notify(`[${EXT}] Need at least 2 entries to reorder`, "warning");
+            continue;
+          }
+
+          const fromChoice = await ctx.ui.select("Move which stack entry?", [
+            ...entryOptions,
+            "← Back",
+            "Cancel",
+          ]);
+          if (!fromChoice || fromChoice === "Cancel") return "cancel";
+          if (fromChoice === "← Back") continue;
+
+          const fromIndex = entryOptions.indexOf(fromChoice);
+          if (fromIndex < 0) continue;
+
+          const toChoice = await ctx.ui.select("Move to which position?", [
+            ...entryOptions,
+            "← Back",
+            "Cancel",
+          ]);
+          if (!toChoice || toChoice === "Cancel") return "cancel";
+          if (toChoice === "← Back") continue;
+
+          const toIndex = entryOptions.indexOf(toChoice);
+          if (toIndex < 0 || toIndex === fromIndex) continue;
+
+          const [picked] = preferenceStackDraft.splice(fromIndex, 1);
+          preferenceStackDraft.splice(toIndex, 0, picked);
+          continue;
+        }
+
+        if (choice === "Set model override") {
+          const targetChoice = await ctx.ui.select("Set model for which stack entry?", [
+            ...entryOptions,
+            "← Back",
+            "Cancel",
+          ]);
+          if (!targetChoice || targetChoice === "Cancel") return "cancel";
+          if (targetChoice === "← Back") continue;
+
+          const targetIndex = entryOptions.indexOf(targetChoice);
+          if (targetIndex < 0) continue;
+
+          const currentModel = preferenceStackDraft[targetIndex]?.model ?? "";
+          const modelRes = await inputWithBack(
+            "Model override (leave empty to follow current model)",
+            currentModel,
+          );
+          if (modelRes.nav === "cancel") return "cancel";
+          if (modelRes.nav === "back") continue;
+
+          const trimmed = String(modelRes.value ?? "").trim();
+          if (trimmed) {
+            preferenceStackDraft[targetIndex] = {
+              ...preferenceStackDraft[targetIndex],
+              model: trimmed,
+            };
+          } else {
+            preferenceStackDraft[targetIndex] = {
+              route_id: preferenceStackDraft[targetIndex].route_id,
+            };
+          }
+        }
+      }
+    }
+
+    let stage: "dest" | "vendors" | "routes" | "order" | "default" | "policy" | "stack" = "dest";
 
     while (true) {
       if (stage === "dest") {
@@ -2086,31 +2620,121 @@ export default function (pi: ExtensionAPI): void {
         continue;
       }
 
-      const vendorNames = Array.from(vendorConfigs.keys());
-      const defaultChoice = await ctx.ui.select("Default vendor", [
-        ...vendorNames,
-        "← Back",
-        "Cancel",
-      ]);
+      if (stage === "default") {
+        const vendorNames = Array.from(vendorConfigs.keys());
+        if (vendorNames.length === 0) {
+          stage = "vendors";
+          continue;
+        }
 
-      if (!defaultChoice || defaultChoice === "Cancel") {
-        ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
-        return;
-      }
+        if (!vendorNames.includes(defaultVendorChoice)) {
+          defaultVendorChoice = vendorNames[0];
+        }
 
-      if (defaultChoice === "← Back") {
-        stage = "order";
+        const defaultChoice = await ctx.ui.select("Default vendor", [
+          ...vendorNames,
+          "← Back",
+          "Cancel",
+        ]);
+
+        if (!defaultChoice || defaultChoice === "Cancel") {
+          ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+          return;
+        }
+
+        if (defaultChoice === "← Back") {
+          stage = "order";
+          continue;
+        }
+
+        defaultVendorChoice = defaultChoice;
+        stage = "policy";
         continue;
       }
 
-      const out = normalizeConfig({
-        enabled: true,
-        default_vendor: defaultChoice,
-        vendors: vendorNames
-          .map((name) => vendorConfigs.get(name))
-          .filter((v): v is VendorConfig => Boolean(v)),
-        rate_limit_patterns: cfg?.rate_limit_patterns ?? [],
-      });
+      if (stage === "policy") {
+        const policyChoice = await ctx.ui.select("Failover policy", [
+          `Scope: ${failoverScope === "global" ? "Cross-vendor" : "Current vendor only"}`,
+          `Return to preferred: ${returnEnabled ? "On" : "Off"}`,
+          `Return stable minutes: ${returnStableMinutes}`,
+          `Trigger rate_limit: ${triggerRateLimit ? "On" : "Off"}`,
+          `Trigger quota_exhausted: ${triggerQuota ? "On" : "Off"}`,
+          `Trigger auth_error: ${triggerAuth ? "On" : "Off"}`,
+          "Continue",
+          "← Back",
+          "Cancel",
+        ]);
+
+        if (!policyChoice || policyChoice === "Cancel") {
+          ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+          return;
+        }
+
+        if (policyChoice === "← Back") {
+          stage = "default";
+          continue;
+        }
+
+        if (policyChoice.startsWith("Scope:")) {
+          failoverScope = failoverScope === "global" ? "current_vendor" : "global";
+          continue;
+        }
+
+        if (policyChoice.startsWith("Return to preferred:")) {
+          returnEnabled = !returnEnabled;
+          continue;
+        }
+
+        if (policyChoice.startsWith("Return stable minutes:")) {
+          const minutesRes = await inputWithBack(
+            "Return stable minutes (0 disables holdoff)",
+            String(returnStableMinutes),
+          );
+          if (minutesRes.nav === "cancel") {
+            ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+            return;
+          }
+          if (minutesRes.nav === "back") continue;
+
+          const parsed = Number(String(minutesRes.value ?? "").trim());
+          if (!Number.isFinite(parsed) || parsed < 0) {
+            ctx.ui.notify(`[${EXT}] Enter a non-negative integer`, "warning");
+            continue;
+          }
+          returnStableMinutes = Math.floor(parsed);
+          continue;
+        }
+
+        if (policyChoice.startsWith("Trigger rate_limit:")) {
+          triggerRateLimit = !triggerRateLimit;
+          continue;
+        }
+
+        if (policyChoice.startsWith("Trigger quota_exhausted:")) {
+          triggerQuota = !triggerQuota;
+          continue;
+        }
+
+        if (policyChoice.startsWith("Trigger auth_error:")) {
+          triggerAuth = !triggerAuth;
+          continue;
+        }
+
+        stage = "stack";
+        continue;
+      }
+
+      const nav = await configurePreferenceStack(defaultVendorChoice);
+      if (nav === "cancel") {
+        ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+        return;
+      }
+      if (nav === "back") {
+        stage = "policy";
+        continue;
+      }
+
+      const out = buildDraftNormalized(defaultVendorChoice);
 
       writeJson(targetPath, configToJson(out));
 
@@ -2142,7 +2766,7 @@ export default function (pi: ExtensionAPI): void {
       "Setup wizard",
       "OAuth login checklist",
       "Edit config",
-      "Reorder routes",
+      "Reorder failover stack",
       "Reload config",
     ];
 
@@ -2175,7 +2799,7 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
-    if (selected === "Reorder routes") {
+    if (selected === "Reorder failover stack") {
       await reorderVendorInteractive(ctx);
       return;
     }
@@ -2224,7 +2848,7 @@ export default function (pi: ExtensionAPI): void {
       await useFirstRouteForAuthType(ctx, vendor, authType, label, targetModel, "tool prefer");
     }
 
-    return `Set ${vendor}/${authType}/${label} as first failover route and saved config to ${savePath}.`;
+    return `Moved ${vendor}/${authType}/${label} to the top of the preference stack and saved config to ${savePath}.`;
   }
 
   // Register aliases as early as possible (extension load-time).
@@ -2437,7 +3061,7 @@ export default function (pi: ExtensionAPI): void {
             "  subscription <vendor> [label] [modelId]\n" +
             "  api <vendor> [label] [modelId]\n" +
             "  rename <vendor> <auth_type> <old_label> <new_label>\n" +
-            "  reorder [vendor]              Interactive reorder for vendor routes\n" +
+            "  reorder [vendor]              Interactive reorder for failover preference stack\n" +
             "  edit                          Edit JSON config with validation\n" +
             "  models <vendor>               Show compatible models across routes\n" +
             "\nCompatibility aliases:\n" +
@@ -2497,6 +3121,7 @@ export default function (pi: ExtensionAPI): void {
         clearRetryTimer();
         restoreOriginalEnv();
         pendingOauthReminderProviders = [];
+        nextReturnEligibleAtMs = 0;
         if (ctx.hasUI) {
           ctx.ui.notify(`[${EXT}] enabled=false (runtime)`, "warning");
           ctx.ui.setStatus(EXT, undefined);
@@ -2691,7 +3316,6 @@ export default function (pi: ExtensionAPI): void {
     if (message?.stopReason !== "error") return;
 
     const err = message?.errorMessage ?? message?.details?.error ?? message?.error ?? "unknown error";
-    if (!isRateLimitError(err, cfg.rate_limit_patterns)) return;
 
     const provider = ctx.model?.provider;
     const modelId = ctx.model?.id;
@@ -2704,19 +3328,46 @@ export default function (pi: ExtensionAPI): void {
     const route = getRoute(resolved.vendor, resolved.index);
     if (!vendorCfg || !route) return;
 
-    const parsedRetryMs = parseRetryAfterMs(err);
+    const triggeredByRateLimit =
+      cfg.failover.triggers.rate_limit && isRateLimitSignalError(err, cfg.rate_limit_patterns);
+    const triggeredByQuota = cfg.failover.triggers.quota_exhausted && isQuotaExhaustedError(err);
+    const triggeredByAuth =
+      cfg.failover.triggers.auth_error &&
+      route.auth_type === "api_key" &&
+      isAuthError(err);
+
+    if (!triggeredByRateLimit && !triggeredByQuota && !triggeredByAuth) return;
+
+    const parsedRetryMs = triggeredByAuth ? undefined : parseRetryAfterMs(err);
     const defaultCooldownMs = routeDefaultCooldownMinutes(vendorCfg, route) * 60_000;
     const bufferMs = route.auth_type === "oauth" ? 15_000 : 5_000;
     const until = now() + (parsedRetryMs ?? defaultCooldownMs) + bufferMs;
-
     setRouteCooldownUntil(resolved.vendor, resolved.index, until);
 
-    const nextIdx = selectNextRouteIndexForFailover(ctx, resolved.vendor, modelId, resolved.index);
-    if (nextIdx === undefined) {
+    const effective = buildEffectivePreferenceStack(resolved.vendor, modelId);
+    const currentIdx = findCurrentEffectiveStackIndex(effective, route.id, modelId);
+    const start = currentIdx === undefined ? 0 : currentIdx + 1;
+
+    let nextEntry: EffectivePreferenceEntry | undefined;
+    for (let i = start; i < effective.length; i++) {
+      const candidate = effective[i];
+      if (routeEligibleRef(ctx, candidate.route_ref, candidate.model_id)) {
+        nextEntry = candidate;
+        break;
+      }
+    }
+
+    const triggerLabel = triggeredByAuth
+      ? "auth error"
+      : triggeredByQuota
+        ? "quota exhausted"
+        : "rate limited";
+
+    if (!nextEntry) {
       if (ctx.hasUI) {
         const mins = Math.max(0, Math.ceil((until - now()) / 60000));
         ctx.ui.notify(
-          `[${EXT}] ${routeDisplay(resolved.vendor, route)} appears rate-limited; no eligible next route for model '${modelId}' (retry ~${mins}m)`,
+          `[${EXT}] ${routeDisplay(resolved.vendor, route)} ${triggerLabel}; no eligible lower-priority entry in preference stack (retry ~${mins}m)`,
           "warning",
         );
       }
@@ -2725,21 +3376,20 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
-    const nextRoute = getRoute(resolved.vendor, nextIdx)!;
     if (ctx.hasUI) {
       const source = parsedRetryMs !== undefined ? "provider retry hint" : "configured cooldown";
       ctx.ui.notify(
-        `[${EXT}] ${routeDisplay(resolved.vendor, route)} rate-limited; switching to ${routeDisplay(resolved.vendor, nextRoute)} (${source})`,
+        `[${EXT}] ${routeDisplay(resolved.vendor, route)} ${triggerLabel}; switching to ${routeDisplay(nextEntry.route_ref.vendor, nextEntry.route_ref.route)} (${nextEntry.model_id}, ${source})`,
         "warning",
       );
     }
 
     const switched = await switchToRoute(
       ctx,
-      resolved.vendor,
-      nextIdx,
-      modelId,
-      "rate limited",
+      nextEntry.route_ref.vendor,
+      nextEntry.route_ref.index,
+      nextEntry.model_id,
+      triggerLabel,
       true,
     );
 
@@ -2749,10 +3399,15 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
+    if (cfg.failover.return_to_preferred.enabled) {
+      const holdoffMs = cfg.failover.return_to_preferred.min_stable_minutes * 60_000;
+      nextReturnEligibleAtMs = Math.max(nextReturnEligibleAtMs, now() + holdoffMs);
+    }
+
     // Auto-retry only when moving from OAuth to API key route and vendor policy allows it.
     if (
       route.auth_type === "oauth" &&
-      nextRoute.auth_type === "api_key" &&
+      nextEntry.route_ref.route.auth_type === "api_key" &&
       vendorCfg.auto_retry &&
       lastPrompt &&
       lastPrompt.source !== "extension"
@@ -2778,6 +3433,7 @@ export default function (pi: ExtensionAPI): void {
     lastCtx = ctx;
     rememberActiveFromCtx(ctx);
     managedModelId = ctx.model?.id;
+    nextReturnEligibleAtMs = 0;
 
     // If we start on an api_key route we might need to apply env material now.
     const provider = ctx.model?.provider;
@@ -2801,6 +3457,7 @@ export default function (pi: ExtensionAPI): void {
     lastCtx = ctx;
     rememberActiveFromCtx(ctx);
     managedModelId = ctx.model?.id;
+    nextReturnEligibleAtMs = 0;
     scheduleRetryTimer(ctx);
     await refreshOauthReminderWidget(ctx, configuredOauthProviders());
     updateStatus(ctx);
@@ -2808,6 +3465,7 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async () => {
     clearRetryTimer();
+    nextReturnEligibleAtMs = 0;
     restoreOriginalEnv();
   });
 }
