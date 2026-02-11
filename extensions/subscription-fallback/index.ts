@@ -1501,24 +1501,32 @@ export default function (pi: ExtensionAPI): void {
     ctx.ui.setStatus(EXT, msg);
   }
 
-  function buildStatusLines(ctx: any): string[] {
+  function buildStatusLines(ctx: any, detailed = false): string[] {
     if (!cfg) return ["(no config loaded)"];
 
     const lines: string[] = [];
-    lines.push(`[${EXT}] enabled=${cfg.enabled} default_vendor=${cfg.default_vendor}`);
-    lines.push(
-      `failover scope=${cfg.failover.scope} return_to_preferred=${cfg.failover.return_to_preferred.enabled} stable=${cfg.failover.return_to_preferred.min_stable_minutes}m triggers(rate_limit=${cfg.failover.triggers.rate_limit},quota=${cfg.failover.triggers.quota_exhausted},auth=${cfg.failover.triggers.auth_error})`,
-    );
-
-    if (nextReturnEligibleAtMs > now()) {
-      const mins = Math.max(0, Math.ceil((nextReturnEligibleAtMs - now()) / 60000));
-      lines.push(`return_holdoff~${mins}m`);
-    }
 
     const currentProvider = ctx.model?.provider;
     const currentModel = ctx.model?.id;
-    if (currentProvider && currentModel) {
-      lines.push(`current_model=${currentProvider}/${currentModel}`);
+    const currentResolved = currentProvider ? resolveVendorRouteForProvider(currentProvider) : undefined;
+    const currentRoute = currentResolved
+      ? getRoute(currentResolved.vendor, currentResolved.index)
+      : undefined;
+
+    if (detailed) {
+      lines.push(`[${EXT}] enabled=${cfg.enabled} default_vendor=${cfg.default_vendor}`);
+      lines.push(
+        `failover scope=${cfg.failover.scope} return_to_preferred=${cfg.failover.return_to_preferred.enabled} stable=${cfg.failover.return_to_preferred.min_stable_minutes}m triggers(rate_limit=${cfg.failover.triggers.rate_limit},quota=${cfg.failover.triggers.quota_exhausted},auth=${cfg.failover.triggers.auth_error})`,
+      );
+
+      if (nextReturnEligibleAtMs > now()) {
+        const mins = Math.max(0, Math.ceil((nextReturnEligibleAtMs - now()) / 60000));
+        lines.push(`return_holdoff~${mins}m`);
+      }
+
+      if (currentProvider && currentModel) {
+        lines.push(`current_model=${currentProvider}/${currentModel}`);
+      }
     }
 
     lines.push("preference_stack:");
@@ -1530,35 +1538,63 @@ export default function (pi: ExtensionAPI): void {
         continue;
       }
 
-      const cooling = isRouteCoolingDown(ref.vendor, ref.index)
-        ? `cooldown~${Math.max(0, Math.ceil((getRouteCooldownUntil(ref.vendor, ref.index) - now()) / 60000))}m`
-        : "ready";
-      const model = entry.model ? ` model=${entry.model}` : " model=<follow_current>";
-      lines.push(
-        `  ${i + 1}. ${routeDisplay(ref.vendor, ref.route)} (id=${ref.route.id},${model}, ${cooling})`,
-      );
+      const modelId = entry.model ?? currentModel;
+
+      const isActive =
+        currentRoute !== undefined &&
+        currentRoute.id === ref.route.id &&
+        (entry.model === undefined || entry.model === currentModel);
+
+      let state = "ready";
+      if (!modelId) {
+        state = "waiting_for_current_model";
+      } else if (isRouteCoolingDown(ref.vendor, ref.index)) {
+        const mins = Math.max(
+          0,
+          Math.ceil((getRouteCooldownUntil(ref.vendor, ref.index) - now()) / 60000),
+        );
+        state = `cooldown~${mins}m`;
+      } else if (!routeCanHandleModel(ctx, ref.route, modelId)) {
+        state = "model_unavailable";
+      } else if (!routeHasUsableCredentials(ref.vendor, ref.route)) {
+        state = "missing_credentials";
+      }
+
+      const activeMark = isActive ? "*" : " ";
+      if (detailed) {
+        const modelOverridePart = entry.model ? `, model_override=${entry.model}` : "";
+        lines.push(
+          `  ${activeMark} ${i + 1}. ${routeDisplay(ref.vendor, ref.route)} (id=${ref.route.id}, provider=${ref.route.provider_id}${modelOverridePart}, ${state})`,
+        );
+      } else {
+        lines.push(
+          `  ${activeMark} ${i + 1}. ${routeDisplay(ref.vendor, ref.route)} (${state})`,
+        );
+      }
     }
 
-    for (const v of cfg.vendors) {
-      lines.push(`vendor ${v.vendor}:`);
-      for (let i = 0; i < v.routes.length; i++) {
-        const route = v.routes[i];
-        const active = activeRouteIndexByVendor.get(v.vendor) === i ? "*" : " ";
-        const cooling = isRouteCoolingDown(v.vendor, i)
-          ? `cooldown~${Math.max(0, Math.ceil((getRouteCooldownUntil(v.vendor, i) - now()) / 60000))}m`
-          : "ready";
-        lines.push(
-          `  ${active} ${i + 1}. ${route.auth_type} ${decode(route.label)} (id=${route.id}, provider=${route.provider_id}, ${cooling})`,
-        );
+    if (detailed) {
+      for (const v of cfg.vendors) {
+        lines.push(`vendor ${v.vendor}:`);
+        for (let i = 0; i < v.routes.length; i++) {
+          const route = v.routes[i];
+          const active = activeRouteIndexByVendor.get(v.vendor) === i ? "*" : " ";
+          const cooling = isRouteCoolingDown(v.vendor, i)
+            ? `cooldown~${Math.max(0, Math.ceil((getRouteCooldownUntil(v.vendor, i) - now()) / 60000))}m`
+            : "ready";
+          lines.push(
+            `  ${active} ${i + 1}. ${route.auth_type} ${decode(route.label)} (id=${route.id}, provider=${route.provider_id}, ${cooling})`,
+          );
+        }
       }
     }
 
     return lines;
   }
 
-  function notifyStatus(ctx: any): void {
+  function notifyStatus(ctx: any, detailed = false): void {
     if (!ctx.hasUI) return;
-    ctx.ui.notify(buildStatusLines(ctx).join("\n"), "info");
+    ctx.ui.notify(buildStatusLines(ctx, detailed).join("\n"), "info");
   }
 
   function configuredOauthProviders(): string[] {
@@ -1969,7 +2005,7 @@ export default function (pi: ExtensionAPI): void {
 
     const labels = indexed.map((x, i) => {
       const ref = x.ref!;
-      const model = x.entry.model ?? "<follow_current>";
+      const model = x.entry.model ?? "current";
       return `${i + 1}. ${routeDisplay(ref.vendor, ref.route)} model=${model}`;
     });
 
@@ -2065,13 +2101,33 @@ export default function (pi: ExtensionAPI): void {
     }
 
     ctx.ui.notify(`[${EXT}] Starting setup wizard…`, "info");
+    ctx.ui.notify(
+      `[${EXT}] Changes are applied only when you finish setup. Cancel keeps current config.`,
+      "info",
+    );
 
     type WizardNav = "ok" | "back" | "cancel";
 
-    async function inputWithBack(title: string, placeholder: string): Promise<{ nav: WizardNav; value?: string }> {
-      const raw = await ctx.ui.input(`${title}\nType /back to go to previous screen`, placeholder);
+    async function inputWithBack(
+      title: string,
+      currentValue: string,
+      options?: { allowEmpty?: boolean },
+    ): Promise<{ nav: WizardNav; value?: string }> {
+      const shownValue = String(currentValue ?? "");
+      const currentDisplay = shownValue.trim() ? shownValue : "(empty)";
+      const raw = await ctx.ui.input(
+        `${title}\nCurrent: ${currentDisplay}\nPress Enter to keep current value.\nType /back to go to previous screen`,
+        shownValue,
+      );
       if (raw === undefined) return { nav: "cancel" };
-      if (raw.trim().toLowerCase() === "/back") return { nav: "back" };
+
+      const trimmed = raw.trim();
+      if (trimmed.toLowerCase() === "/back") return { nav: "back" };
+
+      if (!options?.allowEmpty && trimmed === "") {
+        return { nav: "ok", value: shownValue };
+      }
+
       return { nav: "ok", value: raw };
     }
 
@@ -2277,7 +2333,7 @@ export default function (pi: ExtensionAPI): void {
       }
     }
 
-    let targetPath = globalConfigPath();
+    let targetPath = preferredWritableConfigPath(ctx.cwd);
     let useOpenAI = true;
     let useClaude = false;
 
@@ -2391,7 +2447,7 @@ export default function (pi: ExtensionAPI): void {
         const summary = preview.preference_stack
           .map(
             (entry, i) =>
-              `${i + 1}. ${previewRouteLabel(preview, entry.route_id)} model=${entry.model ?? "<follow_current>"}`,
+              `${i + 1}. ${previewRouteLabel(preview, entry.route_id)} model=${entry.model ?? "current"}`,
           )
           .join("\n");
 
@@ -2418,7 +2474,7 @@ export default function (pi: ExtensionAPI): void {
 
         const entryOptions = preview.preference_stack.map(
           (entry, i) =>
-            `${i + 1}. ${previewRouteLabel(preview, entry.route_id)} model=${entry.model ?? "<follow_current>"}`,
+            `${i + 1}. ${previewRouteLabel(preview, entry.route_id)} model=${entry.model ?? "current"}`,
         );
 
         if (choice === "Move entry") {
@@ -2468,21 +2524,25 @@ export default function (pi: ExtensionAPI): void {
 
           const currentModel = preferenceStackDraft[targetIndex]?.model ?? "";
           const modelRes = await inputWithBack(
-            "Model override (leave empty to follow current model)",
+            "Model override (type 'current' to clear override and follow /model)",
             currentModel,
           );
           if (modelRes.nav === "cancel") return "cancel";
           if (modelRes.nav === "back") continue;
 
           const trimmed = String(modelRes.value ?? "").trim();
-          if (trimmed) {
+          if (
+            trimmed.toLowerCase() === "current" ||
+            trimmed.toLowerCase() === "follow_current" ||
+            trimmed.toLowerCase() === "none"
+          ) {
+            preferenceStackDraft[targetIndex] = {
+              route_id: preferenceStackDraft[targetIndex].route_id,
+            };
+          } else if (trimmed) {
             preferenceStackDraft[targetIndex] = {
               ...preferenceStackDraft[targetIndex],
               model: trimmed,
-            };
-          } else {
-            preferenceStackDraft[targetIndex] = {
-              route_id: preferenceStackDraft[targetIndex].route_id,
             };
           }
         }
@@ -2493,18 +2553,21 @@ export default function (pi: ExtensionAPI): void {
 
     while (true) {
       if (stage === "dest") {
-        const destChoice = await ctx.ui.select("Where should subswitch config live?", [
-          `Global (${globalConfigPath()})`,
-          `Project (${projectConfigPath(ctx.cwd)})`,
-          "Cancel",
-        ]);
+        const globalDest = `Global (${globalConfigPath()})`;
+        const projectDest = `Project (${projectConfigPath(ctx.cwd)})`;
+        const preferProject = targetPath === projectConfigPath(ctx.cwd);
+
+        const destChoice = await ctx.ui.select(
+          "Where should subswitch config live?",
+          preferProject ? [projectDest, globalDest, "Cancel"] : [globalDest, projectDest, "Cancel"],
+        );
 
         if (!destChoice || destChoice === "Cancel") {
           ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
           return;
         }
 
-        targetPath = destChoice.startsWith("Project")
+        targetPath = destChoice === projectDest
           ? projectConfigPath(ctx.cwd)
           : globalConfigPath();
 
@@ -2514,9 +2577,9 @@ export default function (pi: ExtensionAPI): void {
 
       if (stage === "vendors") {
         const choice = await ctx.ui.select("Select vendors to configure", [
+          "Continue",
           `OpenAI: ${useOpenAI ? "Yes" : "No"}`,
           `Claude: ${useClaude ? "Yes" : "No"}`,
-          "Continue",
           "← Back",
           "Cancel",
         ]);
@@ -2631,8 +2694,13 @@ export default function (pi: ExtensionAPI): void {
           defaultVendorChoice = vendorNames[0];
         }
 
+        const orderedVendorNames = [
+          defaultVendorChoice,
+          ...vendorNames.filter((v) => v !== defaultVendorChoice),
+        ];
+
         const defaultChoice = await ctx.ui.select("Default vendor", [
-          ...vendorNames,
+          ...orderedVendorNames,
           "← Back",
           "Cancel",
         ]);
@@ -2654,13 +2722,13 @@ export default function (pi: ExtensionAPI): void {
 
       if (stage === "policy") {
         const policyChoice = await ctx.ui.select("Failover policy", [
+          "Continue",
           `Scope: ${failoverScope === "global" ? "Cross-vendor" : "Current vendor only"}`,
           `Return to preferred: ${returnEnabled ? "On" : "Off"}`,
-          `Return stable minutes: ${returnStableMinutes}`,
-          `Trigger rate_limit: ${triggerRateLimit ? "On" : "Off"}`,
-          `Trigger quota_exhausted: ${triggerQuota ? "On" : "Off"}`,
-          `Trigger auth_error: ${triggerAuth ? "On" : "Off"}`,
-          "Continue",
+          `Minimum time on fallback (minutes): ${returnStableMinutes}`,
+          `Failover on rate limit: ${triggerRateLimit ? "On" : "Off"}`,
+          `Failover on exhausted quota: ${triggerQuota ? "On" : "Off"}`,
+          `Failover on auth error (API key routes): ${triggerAuth ? "On" : "Off"}`,
           "← Back",
           "Cancel",
         ]);
@@ -2685,9 +2753,9 @@ export default function (pi: ExtensionAPI): void {
           continue;
         }
 
-        if (policyChoice.startsWith("Return stable minutes:")) {
+        if (policyChoice.startsWith("Minimum time on fallback (minutes):")) {
           const minutesRes = await inputWithBack(
-            "Return stable minutes (0 disables holdoff)",
+            "Minimum time on fallback in minutes (0 = no holdoff)",
             String(returnStableMinutes),
           );
           if (minutesRes.nav === "cancel") {
@@ -2705,17 +2773,17 @@ export default function (pi: ExtensionAPI): void {
           continue;
         }
 
-        if (policyChoice.startsWith("Trigger rate_limit:")) {
+        if (policyChoice.startsWith("Failover on rate limit:")) {
           triggerRateLimit = !triggerRateLimit;
           continue;
         }
 
-        if (policyChoice.startsWith("Trigger quota_exhausted:")) {
+        if (policyChoice.startsWith("Failover on exhausted quota:")) {
           triggerQuota = !triggerQuota;
           continue;
         }
 
-        if (policyChoice.startsWith("Trigger auth_error:")) {
+        if (policyChoice.startsWith("Failover on auth error (API key routes):")) {
           triggerAuth = !triggerAuth;
           continue;
         }
@@ -2763,6 +2831,7 @@ export default function (pi: ExtensionAPI): void {
 
     const options: string[] = [
       "Status",
+      "Long status",
       "Setup wizard",
       "OAuth login checklist",
       "Edit config",
@@ -2780,7 +2849,12 @@ export default function (pi: ExtensionAPI): void {
     if (!selected) return;
 
     if (selected === "Status") {
-      notifyStatus(ctx);
+      notifyStatus(ctx, false);
+      return;
+    }
+
+    if (selected === "Long status") {
+      notifyStatus(ctx, true);
       return;
     }
 
@@ -2823,8 +2897,8 @@ export default function (pi: ExtensionAPI): void {
     }
   }
 
-  function toolStatusSummary(ctx: any): string {
-    return buildStatusLines(ctx).join("\n");
+  function toolStatusSummary(ctx: any, detailed = false): string {
+    return buildStatusLines(ctx, detailed).join("\n");
   }
 
   async function toolPreferRoute(
@@ -2858,10 +2932,11 @@ export default function (pi: ExtensionAPI): void {
     name: "subswitch_manage",
     label: "Subswitch Manage",
     description:
-      "Manage subscription/api failover routes for vendors (openai/claude). Supports status, use, prefer, rename, reload.",
+      "Manage subscription/api failover routes for vendors (openai/claude). Supports status/longstatus, use, prefer, rename, reload.",
     parameters: Type.Object({
       action: Type.Union([
         Type.Literal("status"),
+        Type.Literal("longstatus"),
         Type.Literal("use"),
         Type.Literal("prefer"),
         Type.Literal("rename"),
@@ -2885,7 +2960,15 @@ export default function (pi: ExtensionAPI): void {
       const action = String(params.action ?? "").trim();
 
       if (action === "status") {
-        const text = toolStatusSummary(ctx);
+        const text = toolStatusSummary(ctx, false);
+        return {
+          content: [{ type: "text", text }],
+          details: { action, ok: true },
+        };
+      }
+
+      if (action === "longstatus") {
+        const text = toolStatusSummary(ctx, true);
         return {
           content: [{ type: "text", text }],
           details: { action, ok: true },
@@ -2895,7 +2978,7 @@ export default function (pi: ExtensionAPI): void {
       if (action === "reload") {
         reloadCfg(ctx);
         updateStatus(ctx);
-        const text = `Reloaded config.\n${toolStatusSummary(ctx)}`;
+        const text = `Reloaded config.\n${toolStatusSummary(ctx, false)}`;
         return {
           content: [{ type: "text", text }],
           details: { action, ok: true },
@@ -3014,7 +3097,7 @@ export default function (pi: ExtensionAPI): void {
         content: [
           {
             type: "text",
-            text: `Unknown action '${action}'. Supported: status, use, prefer, rename, reload.`,
+            text: `Unknown action '${action}'. Supported: status, longstatus, use, prefer, rename, reload.`,
           },
         ],
         details: { action, ok: false },
@@ -3034,11 +3117,11 @@ export default function (pi: ExtensionAPI): void {
       const parts = splitArgs(args || "");
       const cmd = parts[0] ?? "";
 
-      if (cmd === "" || cmd === "status") {
+      if (cmd === "" || cmd === "status" || cmd === "longstatus") {
         if (cmd === "") {
           await runQuickPicker(ctx);
         } else {
-          notifyStatus(ctx);
+          notifyStatus(ctx, cmd === "longstatus");
         }
         await refreshOauthReminderWidget(ctx, configuredOauthProviders());
         updateStatus(ctx);
@@ -3051,19 +3134,20 @@ export default function (pi: ExtensionAPI): void {
             "Usage: /subswitch [command]\n\n" +
             "Commands:\n" +
             "  (no args)                     Quick picker + status\n" +
-            "  status                        Show status\n" +
-            "  setup                         Guided setup wizard\n" +
+            "  status                        Show concise status\n" +
+            "  longstatus                    Show detailed status (stack/models/ids)\n" +
+            "  setup                         Guided setup wizard (applies only on finish)\n" +
             "  login                         Prompt OAuth login checklist and prefill /login\n" +
             "  login-status                  Re-check OAuth login completion and update reminder\n" +
             "  reload                        Reload config\n" +
             "  on / off                      Enable/disable extension (runtime)\n" +
+            "  reorder [vendor]              Interactive reorder for failover preference stack\n" +
+            "  edit                          Edit JSON config with validation\n" +
+            "  models <vendor>               Show compatible models across routes\n" +
             "  use <vendor> <auth_type> <label> [modelId]\n" +
             "  subscription <vendor> [label] [modelId]\n" +
             "  api <vendor> [label] [modelId]\n" +
             "  rename <vendor> <auth_type> <old_label> <new_label>\n" +
-            "  reorder [vendor]              Interactive reorder for failover preference stack\n" +
-            "  edit                          Edit JSON config with validation\n" +
-            "  models <vendor>               Show compatible models across routes\n" +
             "\nCompatibility aliases:\n" +
             "  primary [label] [modelId]     == subscription <default_vendor> ...\n" +
             "  fallback [label] [modelId]    == api <default_vendor> ...";

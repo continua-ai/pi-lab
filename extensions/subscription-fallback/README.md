@@ -122,10 +122,13 @@ All control is via `/subswitch`.
   - Quick picker + status.
 
 - `/subswitch status`
-  - Show detailed status.
+  - Show concise status.
+
+- `/subswitch longstatus`
+  - Show detailed status (preference stack, model overrides, route ids).
 
 - `/subswitch setup`
-  - Guided setup wizard (supports Back via `← Back` and `/back` on inputs, includes route order, failover policy/triggers, preference stack, and OAuth login checklist).
+  - Guided setup wizard (supports Back via `← Back` and `/back` on inputs, includes route order, failover policy/triggers, preference stack, and OAuth login checklist). Changes apply only when setup is finished.
 
 - `/subswitch login`
   - Show OAuth login checklist and optionally prefill `/login`.
@@ -174,6 +177,7 @@ The extension registers a tool:
 Supported actions:
 
 - `status`
+- `longstatus`
 - `reload`
 - `use`
 - `prefer` (move matching route entry to the top of failover preference stack, then optionally switch)
