@@ -1,95 +1,136 @@
 // subscription-fallback (pi extension)
 //
-// Automatically switch between a ChatGPT subscription provider (default: openai-codex via /login)
-// and OpenAI API credits (default: openai via OPENAI_API_KEY) when the subscription hits
-// usage limits / rate limits.
-//
-// This extension registers:
-//   - /subswitch (status/help/reload/force/simulate/selftest)
+// v2 UX goals:
+// - support multiple vendors (openai, claude)
+// - support multiple auth routes per vendor (oauth + api_key)
+// - failover order is the order routes are defined in config
+// - model policy is always "follow_current" in v1 (no pinned model)
+// - expose a command UX + LLM-callable tool bridge
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-
-import { getModels, loginOpenAICodex, refreshOpenAICodexToken } from "@mariozechner/pi-ai";
+import {
+  getModels,
+  loginAnthropic,
+  loginOpenAICodex,
+  refreshAnthropicToken,
+  refreshOpenAICodexToken,
+} from "@mariozechner/pi-ai";
+import { Type } from "@sinclair/typebox";
 
 type InputSource = "interactive" | "rpc" | "extension";
+type AuthType = "oauth" | "api_key";
 
-interface OpenAIAccount {
-  /** Optional label for UI/logging (never includes the API key). */
-  name?: string;
+const EXT = "subscription-fallback";
 
-  /** Environment variable name containing an OpenAI API key (preferred). */
-  apiKeyEnv?: string;
+interface RouteConfig {
+  auth_type?: AuthType;
+  label?: string;
+  provider_id?: string;
 
-  /** Path to a file containing an OpenAI API key (trimmed). Supports ~/... */
-  apiKeyPath?: string;
+  // API-key route material (prefer env/path over inline key)
+  api_key_env?: string;
+  api_key_path?: string;
+  api_key?: string;
 
-  /** Raw API key (discouraged; prefer apiKeyEnv/apiKeyPath). */
-  apiKey?: string;
+  // OpenAI optional per-route org/project env names
+  openai_org_id_env?: string;
+  openai_project_id_env?: string;
 
-  /** Optional env var name containing OPENAI_ORG_ID for this account. */
-  openaiOrgIdEnv?: string;
+  // Optional per-route cooldown override
+  cooldown_minutes?: number;
+}
 
-  /** Optional env var name containing OPENAI_PROJECT_ID for this account. */
-  openaiProjectIdEnv?: string;
+interface VendorConfig {
+  vendor?: string;
+  routes?: RouteConfig[];
+
+  // Optional per-vendor defaults
+  oauth_cooldown_minutes?: number;
+  api_key_cooldown_minutes?: number;
+  auto_retry?: boolean;
 }
 
 interface Config {
-  /** Master switch */
   enabled?: boolean;
+  default_vendor?: string;
+  vendors?: VendorConfig[];
+  rate_limit_patterns?: string[];
+}
 
-  /** Subscription provider (via /login). Default: openai-codex */
+interface NormalizedRoute {
+  auth_type: AuthType;
+  label: string;
+  provider_id: string;
+  api_key_env?: string;
+  api_key_path?: string;
+  api_key?: string;
+  openai_org_id_env?: string;
+  openai_project_id_env?: string;
+  cooldown_minutes?: number;
+}
+
+interface NormalizedVendor {
+  vendor: string;
+  routes: NormalizedRoute[];
+  oauth_cooldown_minutes: number;
+  api_key_cooldown_minutes: number;
+  auto_retry: boolean;
+}
+
+interface NormalizedConfig {
+  enabled: boolean;
+  default_vendor: string;
+  vendors: NormalizedVendor[];
+  rate_limit_patterns: string[];
+}
+
+// Legacy schema from v1 (OpenAI-only)
+interface LegacyOpenAIAccount {
+  name?: string;
+  apiKeyEnv?: string;
+  apiKeyPath?: string;
+  apiKey?: string;
+  openaiOrgIdEnv?: string;
+  openaiProjectIdEnv?: string;
+}
+
+interface LegacyConfig {
+  enabled?: boolean;
   primaryProvider?: string;
-
-  /**
-   * Optional: multiple subscription providers (OAuth) to rotate through before using API credits.
-   * If set, this overrides primaryProvider.
-   *
-   * Example: ["openai-codex", "openai-codex-work"]
-   */
   primaryProviders?: string[];
-
-  /** API-key provider (via OPENAI_API_KEY). Default: openai */
   fallbackProvider?: string;
-
-  /** If set, lock switching to this model id. If omitted, follows the currently selected model id (if present in both providers). */
   modelId?: string;
-
-  /** After we detect subscription rate-limit, wait this long before trying the subscription again. Default: 180 */
   cooldownMinutes?: number;
-
-  /** If true, re-send the prompt automatically after switching to fallback. Default: true */
   autoRetry?: boolean;
-
-  /** Extra substrings (case-insensitive) that should count as "rate limited". */
   rateLimitPatterns?: string[];
-
-  /**
-   * If true (default), and the session starts on the fallback provider, the extension will
-   * immediately try to switch back to a subscription provider.
-   *
-   * This prevents getting "stuck" in API mode across restarts when you don't currently have
-   * an API key configured.
-   */
-  preferPrimaryOnStartup?: boolean;
-
-  /**
-   * Optional: rotate among multiple OpenAI accounts while using the fallback provider.
-   * Only supported when fallbackProvider is "openai".
-   */
-  fallbackAccounts?: OpenAIAccount[];
-
-  /**
-   * Default cooldown for a fallback OpenAI account when rate-limited and no retry hint is present.
-   * Default: 15
-   */
+  fallbackAccounts?: LegacyOpenAIAccount[];
   fallbackAccountCooldownMinutes?: number;
 }
 
-const EXT = "subscription-fallback";
+interface LastPrompt {
+  source: InputSource;
+  text: string;
+  images: any[];
+}
+
+interface OriginalEnv {
+  openai_api_key?: string;
+  openai_org_id?: string;
+  openai_project_id?: string;
+  anthropic_api_key?: string;
+}
+
+const decode = (s: string): string => {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+};
 
 function splitArgs(input: string): string[] {
   return input
@@ -97,6 +138,27 @@ function splitArgs(input: string): string[] {
     .split(/\s+/)
     .map((t) => t.trim())
     .filter(Boolean);
+}
+
+function slugify(s: string): string {
+  return s
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/--+/g, "-")
+    .slice(0, 64);
+}
+
+function titleCase(s: string): string {
+  if (!s) return s;
+  return s[0].toUpperCase() + s.slice(1);
+}
+
+function expandHome(path: string): string {
+  if (!path) return path;
+  if (path.startsWith("~/")) return join(homedir(), path.slice(2));
+  return path;
 }
 
 function readJson(path: string): any | undefined {
@@ -109,44 +171,348 @@ function readJson(path: string): any | undefined {
   }
 }
 
-function loadConfig(cwd: string): Config {
-  const globalPath = join(homedir(), ".pi", "agent", "subscription-fallback.json");
-  const projectPath = join(cwd, ".pi", "subscription-fallback.json");
+function writeJson(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(value, null, 2) + "\n", "utf-8");
+}
 
-  const globalCfg = (readJson(globalPath) ?? {}) as Config;
-  const projectCfg = (readJson(projectPath) ?? {}) as Config;
+function globalConfigPath(): string {
+  return join(homedir(), ".pi", "agent", "subswitch.json");
+}
 
-  const merged: Config = {
-    enabled: true,
-    primaryProvider: "openai-codex",
-    fallbackProvider: "openai",
-    cooldownMinutes: 180,
-    autoRetry: true,
-    rateLimitPatterns: [],
-    preferPrimaryOnStartup: true,
-    fallbackAccountCooldownMinutes: 15,
-    ...globalCfg,
-    ...projectCfg,
+function projectConfigPath(cwd: string): string {
+  return join(cwd, ".pi", "subswitch.json");
+}
+
+function legacyGlobalConfigPath(): string {
+  return join(homedir(), ".pi", "agent", "subscription-fallback.json");
+}
+
+function legacyProjectConfigPath(cwd: string): string {
+  return join(cwd, ".pi", "subscription-fallback.json");
+}
+
+function defaultProviderId(vendor: string, authType: AuthType): string {
+  const v = vendor.toLowerCase();
+  if (v === "openai" && authType === "oauth") return "openai-codex";
+  if (v === "openai" && authType === "api_key") return "openai";
+  if ((v === "claude" || v === "anthropic") && authType === "oauth") return "anthropic";
+  if ((v === "claude" || v === "anthropic") && authType === "api_key") return "anthropic-api";
+  return v;
+}
+
+function routeDisplay(vendor: string, route: { auth_type: AuthType; label: string }): string {
+  return `${vendor} · ${route.auth_type} · ${route.label}`;
+}
+
+function mergeVendorLists(globalVendors: VendorConfig[] | undefined, projectVendors: VendorConfig[] | undefined): VendorConfig[] {
+  const g = Array.isArray(globalVendors) ? globalVendors : [];
+  const p = Array.isArray(projectVendors) ? projectVendors : [];
+  if (p.length === 0) return g;
+
+  const byVendor = new Map<string, VendorConfig>();
+  const globalOrder: string[] = [];
+  for (const v of g) {
+    const key = String(v.vendor ?? "").trim().toLowerCase();
+    if (!key) continue;
+    byVendor.set(key, v);
+    globalOrder.push(key);
+  }
+
+  const projectOrder: string[] = [];
+  for (const v of p) {
+    const key = String(v.vendor ?? "").trim().toLowerCase();
+    if (!key) continue;
+    byVendor.set(key, v);
+    projectOrder.push(key);
+  }
+
+  const out: VendorConfig[] = [];
+  const seen = new Set<string>();
+
+  for (const key of projectOrder) {
+    const v = byVendor.get(key);
+    if (!v) continue;
+    out.push(v);
+    seen.add(key);
+  }
+
+  for (const key of globalOrder) {
+    if (seen.has(key)) continue;
+    const v = byVendor.get(key);
+    if (!v) continue;
+    out.push(v);
+  }
+
+  return out;
+}
+
+function normalizeRoute(vendor: string, route: RouteConfig, index: number): NormalizedRoute | undefined {
+  const authType: AuthType = route.auth_type === "oauth" || route.auth_type === "api_key" ? route.auth_type : "oauth";
+
+  const providerId = String(route.provider_id ?? defaultProviderId(vendor, authType)).trim();
+  if (!providerId) return undefined;
+
+  const fallbackLabel = `${authType}-${index + 1}`;
+  const label = String(route.label ?? fallbackLabel).trim() || fallbackLabel;
+
+  const out: NormalizedRoute = {
+    auth_type: authType,
+    label,
+    provider_id: providerId,
   };
 
-  // Normalize
-  merged.enabled = merged.enabled ?? true;
-  merged.primaryProvider = merged.primaryProvider || "openai-codex";
+  if (route.api_key_env) out.api_key_env = String(route.api_key_env).trim();
+  if (route.api_key_path) out.api_key_path = String(route.api_key_path).trim();
+  if (route.api_key) out.api_key = String(route.api_key).trim();
+  if (route.openai_org_id_env) out.openai_org_id_env = String(route.openai_org_id_env).trim();
+  if (route.openai_project_id_env)
+    out.openai_project_id_env = String(route.openai_project_id_env).trim();
 
-  const primaryProviders = Array.isArray(merged.primaryProviders)
-    ? merged.primaryProviders.map((p) => String(p).trim()).filter(Boolean)
+  if (route.cooldown_minutes !== undefined && Number.isFinite(Number(route.cooldown_minutes))) {
+    const n = Math.max(1, Math.floor(Number(route.cooldown_minutes)));
+    out.cooldown_minutes = n;
+  }
+
+  return out;
+}
+
+function normalizeConfig(input: Config | undefined): NormalizedConfig {
+  const vendorsInput = Array.isArray(input?.vendors) ? input?.vendors : [];
+
+  const vendors: NormalizedVendor[] = [];
+  for (const rawVendor of vendorsInput) {
+    const vendorName = String(rawVendor.vendor ?? "").trim().toLowerCase();
+    if (!vendorName) continue;
+
+    const rawRoutes = Array.isArray(rawVendor.routes) ? rawVendor.routes : [];
+    const routes: NormalizedRoute[] = [];
+    for (let i = 0; i < rawRoutes.length; i++) {
+      const normalized = normalizeRoute(vendorName, rawRoutes[i], i);
+      if (normalized) routes.push(normalized);
+    }
+
+    if (routes.length === 0) continue;
+
+    const oauthCooldown = Number.isFinite(Number(rawVendor.oauth_cooldown_minutes))
+      ? Math.max(1, Math.floor(Number(rawVendor.oauth_cooldown_minutes)))
+      : 180;
+
+    const apiCooldown = Number.isFinite(Number(rawVendor.api_key_cooldown_minutes))
+      ? Math.max(1, Math.floor(Number(rawVendor.api_key_cooldown_minutes)))
+      : 15;
+
+    vendors.push({
+      vendor: vendorName,
+      routes,
+      oauth_cooldown_minutes: oauthCooldown,
+      api_key_cooldown_minutes: apiCooldown,
+      auto_retry: rawVendor.auto_retry ?? true,
+    });
+  }
+
+  const defaultVendor = String(input?.default_vendor ?? vendors[0]?.vendor ?? "openai")
+    .trim()
+    .toLowerCase();
+
+  const rateLimitPatterns = Array.isArray(input?.rate_limit_patterns)
+    ? input?.rate_limit_patterns.map((p) => String(p).trim()).filter(Boolean)
     : [];
-  merged.primaryProviders = primaryProviders.length > 0 ? primaryProviders : undefined;
 
-  merged.fallbackProvider = merged.fallbackProvider || "openai";
-  merged.cooldownMinutes = merged.cooldownMinutes ?? 180;
-  merged.autoRetry = merged.autoRetry ?? true;
-  merged.rateLimitPatterns = merged.rateLimitPatterns ?? [];
-  merged.preferPrimaryOnStartup = merged.preferPrimaryOnStartup ?? true;
-  merged.fallbackAccountCooldownMinutes = merged.fallbackAccountCooldownMinutes ?? 15;
-  merged.fallbackAccounts = Array.isArray(merged.fallbackAccounts) ? merged.fallbackAccounts : undefined;
+  return {
+    enabled: input?.enabled ?? true,
+    default_vendor: defaultVendor,
+    vendors,
+    rate_limit_patterns: rateLimitPatterns,
+  };
+}
 
-  return merged;
+function migrateLegacyConfig(legacy: LegacyConfig | undefined): Config | undefined {
+  if (!legacy) return undefined;
+
+  const primaries = Array.isArray(legacy.primaryProviders)
+    ? legacy.primaryProviders.map((p) => String(p).trim()).filter(Boolean)
+    : [];
+  const primaryProvider = String(legacy.primaryProvider ?? "openai-codex").trim();
+
+  const oauthProviders = primaries.length > 0 ? primaries : primaryProvider ? [primaryProvider] : ["openai-codex"];
+
+  const oauthRoutes: RouteConfig[] = oauthProviders.map((providerId) => {
+    let label = providerId;
+    if (providerId === "openai-codex") {
+      label = "personal";
+    } else if (providerId.startsWith("openai-codex-")) {
+      label = providerId.slice("openai-codex-".length);
+    }
+
+    return {
+      auth_type: "oauth",
+      label,
+      provider_id: providerId,
+      cooldown_minutes: legacy.cooldownMinutes,
+    };
+  });
+
+  const fallbackProvider = String(legacy.fallbackProvider ?? "openai").trim() || "openai";
+
+  const fallbackAccounts = Array.isArray(legacy.fallbackAccounts) ? legacy.fallbackAccounts : [];
+  const apiRoutes: RouteConfig[] = [];
+
+  if (fallbackAccounts.length > 0) {
+    for (let i = 0; i < fallbackAccounts.length; i++) {
+      const a = fallbackAccounts[i];
+      const label = String(a.name ?? `api-${i + 1}`).trim() || `api-${i + 1}`;
+      apiRoutes.push({
+        auth_type: "api_key",
+        label,
+        provider_id: fallbackProvider,
+        api_key_env: a.apiKeyEnv,
+        api_key_path: a.apiKeyPath,
+        api_key: a.apiKey,
+        openai_org_id_env: a.openaiOrgIdEnv,
+        openai_project_id_env: a.openaiProjectIdEnv,
+        cooldown_minutes: legacy.fallbackAccountCooldownMinutes,
+      });
+    }
+  } else {
+    apiRoutes.push({
+      auth_type: "api_key",
+      label: "default",
+      provider_id: fallbackProvider,
+      api_key_env: "OPENAI_API_KEY",
+      cooldown_minutes: legacy.fallbackAccountCooldownMinutes,
+    });
+  }
+
+  return {
+    enabled: legacy.enabled ?? true,
+    default_vendor: "openai",
+    rate_limit_patterns: legacy.rateLimitPatterns ?? [],
+    vendors: [
+      {
+        vendor: "openai",
+        routes: [...oauthRoutes, ...apiRoutes],
+        oauth_cooldown_minutes: legacy.cooldownMinutes ?? 180,
+        api_key_cooldown_minutes: legacy.fallbackAccountCooldownMinutes ?? 15,
+        auto_retry: legacy.autoRetry ?? true,
+      },
+    ],
+  };
+}
+
+function loadConfig(cwd: string): NormalizedConfig {
+  const globalPath = globalConfigPath();
+  const projectPath = projectConfigPath(cwd);
+
+  const globalCfg = readJson(globalPath) as Config | undefined;
+  const projectCfg = readJson(projectPath) as Config | undefined;
+
+  let merged: Config | undefined;
+
+  if (globalCfg || projectCfg) {
+    const base: Config = {
+      enabled: true,
+      default_vendor: "openai",
+      vendors: [],
+      rate_limit_patterns: [],
+    };
+
+    merged = {
+      ...base,
+      ...globalCfg,
+      ...projectCfg,
+      vendors: mergeVendorLists(globalCfg?.vendors, projectCfg?.vendors),
+      rate_limit_patterns: projectCfg?.rate_limit_patterns ?? globalCfg?.rate_limit_patterns ?? [],
+    };
+  } else {
+    const legacyGlobal = readJson(legacyGlobalConfigPath()) as LegacyConfig | undefined;
+    const legacyProject = readJson(legacyProjectConfigPath(cwd)) as LegacyConfig | undefined;
+
+    const migratedGlobal = migrateLegacyConfig(legacyGlobal);
+    const migratedProject = migrateLegacyConfig(legacyProject);
+
+    if (migratedGlobal || migratedProject) {
+      merged = {
+        enabled: true,
+        default_vendor: "openai",
+        vendors: mergeVendorLists(migratedGlobal?.vendors, migratedProject?.vendors),
+        rate_limit_patterns:
+          migratedProject?.rate_limit_patterns ?? migratedGlobal?.rate_limit_patterns ?? [],
+      };
+    }
+  }
+
+  const normalized = normalizeConfig(merged);
+
+  if (normalized.vendors.length === 0) {
+    // Safe bootstrap default: OpenAI subscription + OpenAI API key.
+    return normalizeConfig({
+      enabled: true,
+      default_vendor: "openai",
+      vendors: [
+        {
+          vendor: "openai",
+          routes: [
+            { auth_type: "oauth", label: "personal", provider_id: "openai-codex" },
+            {
+              auth_type: "api_key",
+              label: "default",
+              provider_id: "openai",
+              api_key_env: "OPENAI_API_KEY",
+            },
+          ],
+          oauth_cooldown_minutes: 180,
+          api_key_cooldown_minutes: 15,
+          auto_retry: true,
+        },
+      ],
+      rate_limit_patterns: [],
+    });
+  }
+
+  return normalized;
+}
+
+function configToJson(cfg: NormalizedConfig): Config {
+  return {
+    enabled: cfg.enabled,
+    default_vendor: cfg.default_vendor,
+    rate_limit_patterns: cfg.rate_limit_patterns,
+    vendors: cfg.vendors.map((v) => ({
+      vendor: v.vendor,
+      oauth_cooldown_minutes: v.oauth_cooldown_minutes,
+      api_key_cooldown_minutes: v.api_key_cooldown_minutes,
+      auto_retry: v.auto_retry,
+      routes: v.routes.map((r) => ({
+        auth_type: r.auth_type,
+        label: r.label,
+        provider_id: r.provider_id,
+        api_key_env: r.api_key_env,
+        api_key_path: r.api_key_path,
+        api_key: r.api_key,
+        openai_org_id_env: r.openai_org_id_env,
+        openai_project_id_env: r.openai_project_id_env,
+        cooldown_minutes: r.cooldown_minutes,
+      })),
+    })),
+  };
+}
+
+function preferredWritableConfigPath(cwd: string): string {
+  const project = projectConfigPath(cwd);
+  const global = globalConfigPath();
+
+  if (existsSync(project)) return project;
+
+  const legacyProject = legacyProjectConfigPath(cwd);
+  if (existsSync(legacyProject)) return project;
+
+  if (existsSync(global)) return global;
+
+  const legacyGlobal = legacyGlobalConfigPath();
+  if (existsSync(legacyGlobal)) return global;
+
+  return global;
 }
 
 function isContextWindowExceededError(err: unknown): boolean {
@@ -171,7 +537,6 @@ function isContextWindowExceededError(err: unknown): boolean {
 }
 
 function isRateLimitError(err: unknown, extraPatterns: string[] = []): boolean {
-  // Avoid treating "context window exceeded" and similar as quota/rate-limit.
   if (isContextWindowExceededError(err)) return false;
 
   const s = String(err ?? "");
@@ -197,17 +562,6 @@ function isRateLimitError(err: unknown, extraPatterns: string[] = []): boolean {
   return patterns.some((p) => p && l.includes(p));
 }
 
-/**
- * Try to extract when the subscription becomes available again.
- *
- * Supports common patterns like:
- * - JSON-ish: {"resets_at": 1738600000}
- * - ISO timestamp
- * - "Try again in ~53 min"
- * - "Retry after 30s" / "retry after 2m"
- * - "in 1h 23m 10s"
- * - "again at 2pm" (local time)
- */
 function parseRetryAfterMs(err: unknown): number | undefined {
   const s = String(err ?? "");
   if (!s) return undefined;
@@ -273,192 +627,347 @@ function parseRetryAfterMs(err: unknown): number | undefined {
   return undefined;
 }
 
-export default function subscriptionFallback(pi: ExtensionAPI) {
-  let cfg: Config | undefined;
-  let managedModelId: string | undefined;
+function cloneProviderModels(sourceProvider: string): any[] {
+  const models = getModels(sourceProvider);
+  if (!models) return [];
+  return models.map((m) => ({
+    id: m.id,
+    name: m.name,
+    api: m.api,
+    reasoning: m.reasoning,
+    input: m.input,
+    cost: m.cost,
+    contextWindow: m.contextWindow,
+    maxTokens: m.maxTokens,
+    headers: m.headers,
+    compat: (m as any).compat,
+  }));
+}
 
-  // Subscription providers (OAuth) we consider "primary".
-  let primaryProviders: string[] = [];
-  let primaryProviderSet = new Set<string>();
-  let primaryProviderRetryAfter = new Map<string, number>();
+function providerBaseUrl(sourceProvider: string): string | undefined {
+  const models = getModels(sourceProvider);
+  if (!models || models.length === 0) return undefined;
+  return (models[0] as any).baseUrl;
+}
 
-  // When to next attempt switching from fallback -> any primary provider.
-  // (Computed from primaryProviderRetryAfter; 0 means no retry scheduled.)
-  let retryPrimaryAfter = 0;
-
-  // NOTE: pi's ExtensionAPI.registerProvider only takes effect during extension loading.
-  let codexAliasesRegistered = false;
-
-  // Optional: rotate among multiple OpenAI API keys while using the fallback provider.
-  let fallbackAccounts: OpenAIAccount[] = [];
-  let activeFallbackAccountIndex = 0;
-  let fallbackAccountRetryAfter: number[] = [];
-
-  // If we mutate OPENAI_* env vars, capture the originals so `/subswitch off` can restore them.
-  let originalOpenAIEnv:
-    | {
-        apiKey?: string;
-        orgId?: string;
-        projectId?: string;
-      }
-    | undefined;
-
-  let pendingInputSource: InputSource | undefined;
-  let lastPrompt:
-    | {
-        source: InputSource;
-        text: string;
-        images: any[];
-      }
-    | undefined;
-
-  // `ctx.model` can be stale briefly after `pi.setModel()`.
-  let activeProvider: string | undefined;
-  let activeModelId: string | undefined;
+export default function (pi: ExtensionAPI): void {
+  let cfg: NormalizedConfig | undefined;
 
   let lastCtx: any | undefined;
+  let lastPrompt: LastPrompt | undefined;
+  let pendingInputSource: InputSource | undefined;
+
+  // follow_current model policy
+  let managedModelId: string | undefined;
+
+  // Current route state
+  let activeVendor: string | undefined;
+  const activeRouteIndexByVendor = new Map<string, number>();
+
+  // Per-route cooldown state. Key: `${vendor}::${index}` => epoch ms
+  const routeCooldownUntil = new Map<string, number>();
+
+  // Retry timer for cooldown expiry checks
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
-  // One-shot startup behavior: if we start up in fallback mode, try to switch back to a
-  // subscription provider immediately.
-  let startupPreferPrimaryDone = false;
+  // Avoid feedback loops for extension-driven model changes.
+  let pendingExtensionSwitch: { provider: string; modelId: string } | undefined;
 
-  // Track extension-driven switches so we don't treat them as user actions.
-  let pendingExtensionSwitch:
-    | {
-        provider: string;
-        modelId: string;
-      }
-    | undefined;
+  let originalEnv: OriginalEnv | undefined;
+
+  // Keep track of aliases we registered to avoid duplicate work.
+  const registeredAliases = new Set<string>();
+
+  const LOGIN_WIDGET_KEY = `${EXT}-oauth-login`;
+  let pendingOauthReminderProviders: string[] = [];
+
+  function routeKey(vendor: string, index: number): string {
+    return `${vendor}::${index}`;
+  }
 
   function now(): number {
     return Date.now();
   }
 
-  function expandHome(path: string): string {
-    if (path.startsWith("~/")) {
-      return join(homedir(), path.slice(2));
+  function ensureCfg(ctx: any): NormalizedConfig {
+    if (!cfg) {
+      cfg = loadConfig(ctx.cwd);
+      registerAliasesFromConfig(cfg);
     }
-    return path;
+    return cfg;
   }
 
-  function normalizePrimaryProviders(nextCfg: Config): string[] {
-    const raw = Array.isArray(nextCfg.primaryProviders)
-      ? nextCfg.primaryProviders.map((p) => String(p).trim()).filter(Boolean)
-      : [];
+  function reloadCfg(ctx: any): void {
+    cfg = loadConfig(ctx.cwd);
+    registerAliasesFromConfig(cfg);
+  }
 
-    const list = raw.length > 0 ? raw : [String(nextCfg.primaryProvider ?? "openai-codex").trim() || "openai-codex"];
+  function getVendor(vendor: string): NormalizedVendor | undefined {
+    if (!cfg) return undefined;
+    const key = vendor.trim().toLowerCase();
+    return cfg.vendors.find((v) => v.vendor === key);
+  }
 
-    // Normalize + de-dupe while preserving order.
-    const out: string[] = [];
-    const seen = new Set<string>();
+  function getRoute(vendor: string, index: number): NormalizedRoute | undefined {
+    const v = getVendor(vendor);
+    if (!v) return undefined;
+    if (index < 0 || index >= v.routes.length) return undefined;
+    return v.routes[index];
+  }
 
-    for (const p of list) {
-      let id = p;
+  function captureOriginalEnv(): void {
+    if (originalEnv) return;
+    originalEnv = {
+      openai_api_key: process.env.OPENAI_API_KEY,
+      openai_org_id: process.env.OPENAI_ORG_ID,
+      openai_project_id: process.env.OPENAI_PROJECT_ID,
+      anthropic_api_key: process.env.ANTHROPIC_API_KEY,
+    };
+  }
 
-      // Back-compat: we used to recommend openai-codex-personal, but that creates a confusing
-      // third profile alongside the built-in openai-codex provider.
-      if (id === "openai-codex-personal") id = "openai-codex";
+  function restoreOriginalEnv(): void {
+    if (!originalEnv) return;
 
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      out.push(id);
+    if (originalEnv.openai_api_key === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = originalEnv.openai_api_key;
+
+    if (originalEnv.openai_org_id === undefined) delete process.env.OPENAI_ORG_ID;
+    else process.env.OPENAI_ORG_ID = originalEnv.openai_org_id;
+
+    if (originalEnv.openai_project_id === undefined) delete process.env.OPENAI_PROJECT_ID;
+    else process.env.OPENAI_PROJECT_ID = originalEnv.openai_project_id;
+
+    if (originalEnv.anthropic_api_key === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = originalEnv.anthropic_api_key;
+
+    originalEnv = undefined;
+  }
+
+  function resolveApiKey(route: NormalizedRoute): string | undefined {
+    if (route.api_key_env) {
+      const v = process.env[route.api_key_env];
+      if (v && v.trim()) return v.trim();
     }
 
-    return out.length > 0 ? out : ["openai-codex"];
-  }
-
-  function formatPrimaryProviderLabel(provider: string): string {
-    if (provider === "openai-codex") return "personal";
-    if (provider.startsWith("openai-codex-")) {
-      const suffix = provider.slice("openai-codex-".length);
-      return suffix || provider;
+    if (route.api_key_path) {
+      try {
+        const path = expandHome(route.api_key_path);
+        if (existsSync(path)) {
+          const raw = readFileSync(path, "utf-8").trim();
+          if (raw) return raw;
+        }
+      } catch {
+        // ignored
+      }
     }
-    return provider;
+
+    if (route.api_key && route.api_key.trim()) return route.api_key.trim();
+
+    return undefined;
   }
 
-  function computeNextPrimaryRetryAfterMs(): number {
-    let min = 0;
-    for (const p of primaryProviders) {
-      const until = primaryProviderRetryAfter.get(p) ?? 0;
-      if (!until) continue;
-      if (until <= now()) continue;
-      min = min ? Math.min(min, until) : until;
+  function applyApiRouteCredentials(vendor: string, route: NormalizedRoute): boolean {
+    const key = resolveApiKey(route);
+    if (!key) return false;
+
+    captureOriginalEnv();
+
+    if (vendor === "openai") {
+      process.env.OPENAI_API_KEY = key;
+
+      if (route.openai_org_id_env) {
+        const org = process.env[route.openai_org_id_env];
+        if (org && org.trim()) process.env.OPENAI_ORG_ID = org.trim();
+        else delete process.env.OPENAI_ORG_ID;
+      } else {
+        delete process.env.OPENAI_ORG_ID;
+      }
+
+      if (route.openai_project_id_env) {
+        const project = process.env[route.openai_project_id_env];
+        if (project && project.trim()) process.env.OPENAI_PROJECT_ID = project.trim();
+        else delete process.env.OPENAI_PROJECT_ID;
+      } else {
+        delete process.env.OPENAI_PROJECT_ID;
+      }
+
+      return true;
     }
-    return min;
+
+    if (vendor === "claude" || vendor === "anthropic") {
+      process.env.ANTHROPIC_API_KEY = key;
+      return true;
+    }
+
+    return false;
   }
 
-  function recomputeRetryPrimaryAfter(): void {
-    retryPrimaryAfter = computeNextPrimaryRetryAfterMs();
+  function getRouteCooldownUntil(vendor: string, index: number): number {
+    return routeCooldownUntil.get(routeKey(vendor, index)) ?? 0;
   }
 
-  function isPrimaryProvider(provider: string | undefined): boolean {
-    return Boolean(provider && primaryProviderSet.has(provider));
+  function setRouteCooldownUntil(vendor: string, index: number, untilMs: number): void {
+    routeCooldownUntil.set(routeKey(vendor, index), Math.max(untilMs, 0));
   }
 
-  function setPrimaryCooldown(provider: string, untilMs: number): void {
-    if (!isPrimaryProvider(provider)) return;
-    primaryProviderRetryAfter.set(provider, untilMs);
-    recomputeRetryPrimaryAfter();
-  }
-
-  function clearPrimaryCooldown(provider: string): void {
-    if (!isPrimaryProvider(provider)) return;
-    primaryProviderRetryAfter.set(provider, 0);
-    recomputeRetryPrimaryAfter();
-  }
-
-  function isPrimaryCoolingDown(provider: string): boolean {
-    if (!isPrimaryProvider(provider)) return false;
-    const until = primaryProviderRetryAfter.get(provider) ?? 0;
+  function isRouteCoolingDown(vendor: string, index: number): boolean {
+    const until = getRouteCooldownUntil(vendor, index);
     return Boolean(until && now() < until);
   }
 
-  function selectBestPrimaryProvider(): string | undefined {
-    for (const p of primaryProviders) {
-      if (!isPrimaryCoolingDown(p)) return p;
+  function routeDefaultCooldownMinutes(vendorCfg: NormalizedVendor, route: NormalizedRoute): number {
+    if (route.cooldown_minutes !== undefined) return route.cooldown_minutes;
+    return route.auth_type === "oauth"
+      ? vendorCfg.oauth_cooldown_minutes
+      : vendorCfg.api_key_cooldown_minutes;
+  }
+
+  function findRouteIndex(vendor: string, authType: AuthType, label: string): number | undefined {
+    const v = getVendor(vendor);
+    if (!v) return undefined;
+
+    const want = label.trim().toLowerCase();
+    const idx = v.routes.findIndex(
+      (r) => r.auth_type === authType && r.label.trim().toLowerCase() === want,
+    );
+    return idx >= 0 ? idx : undefined;
+  }
+
+  function routeCanHandleModel(ctx: any, route: NormalizedRoute, modelId: string): boolean {
+    return Boolean(ctx.modelRegistry.find(route.provider_id, modelId));
+  }
+
+  function routeHasUsableCredentials(vendor: string, route: NormalizedRoute): boolean {
+    if (route.auth_type === "oauth") return true;
+    return Boolean(resolveApiKey(route));
+  }
+
+  function routeEligible(ctx: any, vendor: string, index: number, modelId: string): boolean {
+    const route = getRoute(vendor, index);
+    if (!route) return false;
+    if (isRouteCoolingDown(vendor, index)) return false;
+    if (!routeCanHandleModel(ctx, route, modelId)) return false;
+    if (!routeHasUsableCredentials(vendor, route)) return false;
+    return true;
+  }
+
+  function selectBestRouteIndex(ctx: any, vendor: string, modelId: string): number | undefined {
+    const v = getVendor(vendor);
+    if (!v) return undefined;
+    for (let i = 0; i < v.routes.length; i++) {
+      if (routeEligible(ctx, vendor, i, modelId)) return i;
     }
     return undefined;
   }
 
-  function selectNextPrimaryProvider(currentProvider: string): string | undefined {
-    if (primaryProviders.length === 0) return undefined;
+  function selectNextRouteIndexForFailover(
+    ctx: any,
+    vendor: string,
+    modelId: string,
+    currentIndex: number,
+  ): number | undefined {
+    const v = getVendor(vendor);
+    if (!v) return undefined;
+    if (v.routes.length <= 1) return undefined;
 
-    const start = Math.max(0, primaryProviders.indexOf(currentProvider));
-    for (let offset = 1; offset <= primaryProviders.length; offset++) {
-      const idx = (start + offset) % primaryProviders.length;
-      const p = primaryProviders[idx];
-      if (!p || p === currentProvider) continue;
-      if (!isPrimaryCoolingDown(p)) return p;
+    for (let offset = 1; offset < v.routes.length; offset++) {
+      const idx = (currentIndex + offset) % v.routes.length;
+      if (idx === currentIndex) continue;
+      if (routeEligible(ctx, vendor, idx, modelId)) return idx;
     }
 
     return undefined;
   }
 
-  function registerCodexAliasProvider(providerId: string): void {
-    // Only handle OpenAI Codex aliases of the form "openai-codex-<name>".
+  function clearRetryTimer(): void {
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = undefined;
+    }
+  }
+
+  function computeNextCooldownExpiry(): number | undefined {
+    let next: number | undefined;
+    for (const until of routeCooldownUntil.values()) {
+      if (!until || until <= now()) continue;
+      if (!next || until < next) next = until;
+    }
+    return next;
+  }
+
+  async function maybePromotePreferredRoute(ctx: any, reason: string): Promise<void> {
+    if (!cfg?.enabled) return;
+    if (!ctx.model?.id || !ctx.model?.provider) return;
+
+    const resolved = resolveVendorRouteForProvider(ctx.model.provider);
+    if (!resolved) return;
+
+    const { vendor, index: currentIndex } = resolved;
+    const modelId = ctx.model.id;
+
+    const bestIdx = selectBestRouteIndex(ctx, vendor, modelId);
+    if (bestIdx === undefined) return;
+
+    if (bestIdx < currentIndex) {
+      if (ctx.hasUI) {
+        const route = getRoute(vendor, bestIdx);
+        if (route) {
+          ctx.ui.notify(
+            `[${EXT}] Cooldown expired; switching back to preferred route (${routeDisplay(vendor, route)})…`,
+            "info",
+          );
+        }
+      }
+      await switchToRoute(ctx, vendor, bestIdx, modelId, reason, true);
+    }
+  }
+
+  function scheduleRetryTimer(ctx: any): void {
+    clearRetryTimer();
+
+    const next = computeNextCooldownExpiry();
+    if (!next) return;
+
+    const delay = Math.max(1000, next - now());
+    retryTimer = setTimeout(async () => {
+      retryTimer = undefined;
+
+      if (!lastCtx) {
+        scheduleRetryTimer(ctx);
+        return;
+      }
+
+      if (typeof lastCtx.isIdle === "function" && !lastCtx.isIdle()) {
+        scheduleRetryTimer(lastCtx);
+        return;
+      }
+
+      try {
+        await maybePromotePreferredRoute(lastCtx, "cooldown expired");
+      } finally {
+        scheduleRetryTimer(lastCtx);
+      }
+    }, delay);
+  }
+
+  function registerOpenAICodexAliasProvider(providerId: string): void {
+    if (!providerId || registeredAliases.has(providerId)) return;
     if (providerId === "openai-codex") return;
-    if (!providerId.startsWith("openai-codex-")) return;
 
-    const codexModels = getModels("openai-codex");
-    if (!codexModels || codexModels.length === 0) return;
+    // Avoid accidentally overriding common non-Codex providers.
+    if (["openai", "anthropic", "github-copilot", "google", "google-gemini-cli"].includes(providerId)) {
+      return;
+    }
 
-    const label = formatPrimaryProviderLabel(providerId);
+    const models = cloneProviderModels("openai-codex");
+    const baseUrl = providerBaseUrl("openai-codex");
+    if (models.length === 0 || !baseUrl) return;
+
+    const label = providerId;
 
     pi.registerProvider(providerId, {
-      baseUrl: codexModels[0]?.baseUrl,
-      models: codexModels.map((m) => ({
-        id: m.id,
-        name: m.name,
-        api: m.api,
-        reasoning: m.reasoning,
-        input: m.input,
-        cost: m.cost,
-        contextWindow: m.contextWindow,
-        maxTokens: m.maxTokens,
-        headers: m.headers,
-        compat: (m as any).compat,
-      })),
+      baseUrl,
+      models,
       oauth: {
         name: `ChatGPT Plus/Pro (Codex Subscription) (${label})`,
         async login(callbacks: any) {
@@ -467,7 +976,6 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
             onPrompt: callbacks.onPrompt,
             onProgress: callbacks.onProgress,
             onManualCodeInput: callbacks.onManualCodeInput,
-            // Make it easier to distinguish multiple logins server-side.
             originator: providerId,
           });
         },
@@ -479,323 +987,157 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
         },
       },
     });
+
+    registeredAliases.add(providerId);
   }
 
-  function registerCodexAliasProvidersFromCfg(nextCfg: Config): void {
-    for (const p of normalizePrimaryProviders(nextCfg)) {
-      registerCodexAliasProvider(p);
+  function registerAnthropicOAuthAliasProvider(providerId: string): void {
+    if (!providerId || registeredAliases.has(providerId)) return;
+    if (providerId === "anthropic") return;
+
+    // Avoid accidentally overriding common non-Anthropic providers.
+    if (["openai", "openai-codex", "github-copilot", "google", "google-gemini-cli"].includes(providerId)) {
+      return;
     }
-  }
 
-  function registerCodexPersonalProviderLabel(): void {
-    // Re-register openai-codex OAuth provider with a clearer name so the /login menu reads
-    // as "personal" vs "work" (and avoids a confusing third alias).
-    pi.registerProvider("openai-codex", {
+    const models = cloneProviderModels("anthropic");
+    const baseUrl = providerBaseUrl("anthropic");
+    if (models.length === 0 || !baseUrl) return;
+
+    const label = providerId;
+
+    pi.registerProvider(providerId, {
+      baseUrl,
+      models,
       oauth: {
-        name: "ChatGPT Plus/Pro (Codex Subscription) (personal)",
+        name: `Anthropic (Claude Pro/Max) (${label})`,
         async login(callbacks: any) {
-          return loginOpenAICodex({
-            onAuth: callbacks.onAuth,
-            onPrompt: callbacks.onPrompt,
-            onProgress: callbacks.onProgress,
-            onManualCodeInput: callbacks.onManualCodeInput,
-            originator: "openai-codex",
-          });
+          return loginAnthropic(
+            (url) => callbacks.onAuth({ url }),
+            () => callbacks.onPrompt({ message: "Paste the authorization code:" }),
+          );
         },
         async refreshToken(credentials: any) {
-          return refreshOpenAICodexToken(String(credentials.refresh));
+          return refreshAnthropicToken(String(credentials.refresh));
         },
         getApiKey(credentials: any) {
           return String(credentials.access);
         },
       },
     });
+
+    registeredAliases.add(providerId);
   }
 
-  function registerCodexAliasesAtStartup(): void {
-    if (codexAliasesRegistered) return;
-    codexAliasesRegistered = true;
+  function registerOpenAIApiAliasProvider(providerId: string): void {
+    if (!providerId || registeredAliases.has(providerId)) return;
+    if (providerId === "openai") return;
 
-    registerCodexPersonalProviderLabel();
+    const models = cloneProviderModels("openai");
+    const baseUrl = providerBaseUrl("openai");
+    if (models.length === 0 || !baseUrl) return;
 
-    // Register any aliases declared in config (so `/login <alias>` works).
-    // NOTE: changing primaryProviders requires a pi restart for new aliases to appear.
-    const bootCfg = loadConfig(process.cwd());
+    pi.registerProvider(providerId, {
+      baseUrl,
+      apiKey: "OPENAI_API_KEY",
+      api: models[0]?.api,
+      models,
+    });
 
-    const ids = new Set<string>();
+    registeredAliases.add(providerId);
+  }
 
-    // Aliases from config
-    for (const p of normalizePrimaryProviders(bootCfg)) {
-      ids.add(p);
-    }
+  function registerAnthropicApiAliasProvider(providerId: string): void {
+    if (!providerId || registeredAliases.has(providerId)) return;
+    if (providerId === "anthropic") return;
 
-    // Register a single standard alias for the common "2 accounts" case.
-    ids.add("openai-codex-work");
+    const models = cloneProviderModels("anthropic");
+    const baseUrl = providerBaseUrl("anthropic");
+    if (models.length === 0 || !baseUrl) return;
 
-    for (const id of ids) {
-      registerCodexAliasProvider(id);
+    pi.registerProvider(providerId, {
+      baseUrl,
+      apiKey: "ANTHROPIC_API_KEY",
+      api: models[0]?.api,
+      models,
+    });
+
+    registeredAliases.add(providerId);
+  }
+
+  function registerAliasesFromConfig(nextCfg: NormalizedConfig): void {
+    for (const v of nextCfg.vendors) {
+      for (const route of v.routes) {
+        if (route.auth_type === "oauth") {
+          if (v.vendor === "openai") registerOpenAICodexAliasProvider(route.provider_id);
+          if (v.vendor === "claude" || v.vendor === "anthropic")
+            registerAnthropicOAuthAliasProvider(route.provider_id);
+        } else {
+          if (v.vendor === "openai" && route.provider_id !== "openai") {
+            registerOpenAIApiAliasProvider(route.provider_id);
+          }
+          if ((v.vendor === "claude" || v.vendor === "anthropic") && route.provider_id !== "anthropic") {
+            registerAnthropicApiAliasProvider(route.provider_id);
+          }
+        }
+      }
     }
   }
 
-  // IMPORTANT: must run during extension loading so provider registrations are applied.
-  registerCodexAliasesAtStartup();
+  function resolveVendorRouteForProvider(providerId: string): { vendor: string; index: number } | undefined {
+    if (!cfg) return undefined;
 
-  function setCfg(nextCfg: Config): void {
-    cfg = nextCfg;
-
-    primaryProviders = normalizePrimaryProviders(nextCfg);
-    primaryProviderSet = new Set(primaryProviders);
-
-    const prev = primaryProviderRetryAfter;
-    primaryProviderRetryAfter = new Map<string, number>();
-    for (const p of primaryProviders) {
-      primaryProviderRetryAfter.set(p, prev.get(p) ?? 0);
-    }
-    recomputeRetryPrimaryAfter();
-
-    // NOTE: OAuth provider alias registration must happen during extension loading.
-    // We register aliases once at startup (see registerCodexAliasesAtStartup()).
-
-    // Only support multi-account rotation for the built-in "openai" provider.
-    fallbackAccounts = nextCfg.fallbackProvider === "openai" ? (nextCfg.fallbackAccounts ?? []) : [];
-    activeFallbackAccountIndex = 0;
-    fallbackAccountRetryAfter = fallbackAccounts.map(() => 0);
-  }
-
-  function ensureCfg(ctx: any): Config {
-    if (!cfg) {
-      setCfg(loadConfig(ctx.cwd));
-    }
-    return cfg;
-  }
-
-  function reloadCfg(ctx: any): void {
-    setCfg(loadConfig(ctx.cwd));
-  }
-
-  function captureOriginalOpenAIEnv(): void {
-    if (originalOpenAIEnv) return;
-    originalOpenAIEnv = {
-      apiKey: process.env.OPENAI_API_KEY,
-      orgId: process.env.OPENAI_ORG_ID,
-      projectId: process.env.OPENAI_PROJECT_ID,
-    };
-  }
-
-  function restoreOriginalOpenAIEnv(): void {
-    if (!originalOpenAIEnv) return;
-
-    if (originalOpenAIEnv.apiKey === undefined) {
-      delete process.env.OPENAI_API_KEY;
-    } else {
-      process.env.OPENAI_API_KEY = originalOpenAIEnv.apiKey;
-    }
-
-    if (originalOpenAIEnv.orgId === undefined) {
-      delete process.env.OPENAI_ORG_ID;
-    } else {
-      process.env.OPENAI_ORG_ID = originalOpenAIEnv.orgId;
-    }
-
-    if (originalOpenAIEnv.projectId === undefined) {
-      delete process.env.OPENAI_PROJECT_ID;
-    } else {
-      process.env.OPENAI_PROJECT_ID = originalOpenAIEnv.projectId;
-    }
-
-    originalOpenAIEnv = undefined;
-  }
-
-  function resolveAccountApiKey(acct: OpenAIAccount): string | undefined {
-    if (acct.apiKeyEnv) {
-      const v = process.env[acct.apiKeyEnv];
-      if (v && v.trim()) return v.trim();
-    }
-
-    if (acct.apiKeyPath) {
-      const p = expandHome(acct.apiKeyPath);
-      if (existsSync(p)) {
-        const v = readFileSync(p, "utf-8").trim();
-        if (v) return v;
+    // Prefer known active index first.
+    for (const [vendor, idx] of activeRouteIndexByVendor.entries()) {
+      const route = getRoute(vendor, idx);
+      if (route && route.provider_id === providerId) {
+        return { vendor, index: idx };
       }
     }
 
-    if (acct.apiKey && acct.apiKey.trim()) return acct.apiKey.trim();
-
-    return undefined;
-  }
-
-  function resolveAccountLabel(acct: OpenAIAccount, index: number): string {
-    if (acct.name && acct.name.trim()) return acct.name.trim();
-    if (acct.apiKeyEnv && acct.apiKeyEnv.trim()) return acct.apiKeyEnv.trim();
-    return `acct${index + 1}`;
-  }
-
-  function canUseFallbackAccount(index: number): boolean {
-    if (index < 0 || index >= fallbackAccounts.length) return false;
-    const until = fallbackAccountRetryAfter[index] ?? 0;
-    if (until && now() < until) return false;
-    return resolveAccountApiKey(fallbackAccounts[index]) !== undefined;
-  }
-
-  function selectNextFallbackAccountIndex(startAt: number): number | undefined {
-    if (fallbackAccounts.length === 0) return undefined;
-
-    for (let offset = 0; offset < fallbackAccounts.length; offset++) {
-      const idx = (startAt + offset) % fallbackAccounts.length;
-      if (canUseFallbackAccount(idx)) return idx;
+    // Fallback to first route match.
+    for (const v of cfg.vendors) {
+      for (let i = 0; i < v.routes.length; i++) {
+        if (v.routes[i].provider_id === providerId) {
+          return { vendor: v.vendor, index: i };
+        }
+      }
     }
 
     return undefined;
-  }
-
-  function activateFallbackAccount(ctx: any, index: number, reason: string, notify: boolean): boolean {
-    const acct = fallbackAccounts[index];
-    if (!acct) return false;
-
-    const key = resolveAccountApiKey(acct);
-    if (!key) return false;
-
-    captureOriginalOpenAIEnv();
-
-    // We only support rotating OPENAI_* for the built-in "openai" provider.
-    process.env.OPENAI_API_KEY = key;
-
-    if (acct.openaiOrgIdEnv) {
-      const org = process.env[acct.openaiOrgIdEnv];
-      if (org && org.trim()) process.env.OPENAI_ORG_ID = org.trim();
-      else delete process.env.OPENAI_ORG_ID;
-    } else {
-      delete process.env.OPENAI_ORG_ID;
-    }
-
-    if (acct.openaiProjectIdEnv) {
-      const project = process.env[acct.openaiProjectIdEnv];
-      if (project && project.trim()) process.env.OPENAI_PROJECT_ID = project.trim();
-      else delete process.env.OPENAI_PROJECT_ID;
-    } else {
-      delete process.env.OPENAI_PROJECT_ID;
-    }
-
-    activeFallbackAccountIndex = index;
-
-    if (notify && ctx.hasUI) {
-      const label = resolveAccountLabel(acct, index);
-      ctx.ui.notify(`[${EXT}] Using OpenAI account '${label}' (${reason})`, "info");
-    }
-
-    return true;
-  }
-
-  function ensureFallbackAccountSelected(ctx: any, reason: string): boolean {
-    if (!cfg?.enabled) return false;
-    if (cfg.fallbackProvider !== "openai") return true;
-    if (fallbackAccounts.length === 0) return true;
-
-    if (canUseFallbackAccount(activeFallbackAccountIndex)) {
-      return activateFallbackAccount(ctx, activeFallbackAccountIndex, reason, false);
-    }
-
-    const idx = selectNextFallbackAccountIndex(0);
-    if (idx === undefined) return false;
-    return activateFallbackAccount(ctx, idx, reason, false);
   }
 
   function rememberActiveFromCtx(ctx: any): void {
-    lastCtx = ctx;
-    if (!activeProvider && ctx.model?.provider) activeProvider = ctx.model.provider;
-    if (!activeModelId && ctx.model?.id) activeModelId = ctx.model.id;
+    if (!cfg) return;
+
+    const provider = ctx.model?.provider;
+    if (!provider) return;
+
+    const resolved = resolveVendorRouteForProvider(provider);
+    if (!resolved) return;
+
+    activeVendor = resolved.vendor;
+    activeRouteIndexByVendor.set(resolved.vendor, resolved.index);
   }
 
-  function clearRetryTimer(): void {
-    if (!retryTimer) return;
-    clearTimeout(retryTimer);
-    retryTimer = undefined;
+  function nearestPreferredCooldownHint(vendor: string, currentIndex: number): string | undefined {
+    const v = getVendor(vendor);
+    if (!v) return undefined;
+
+    let nearestUntil: number | undefined;
+    for (let i = 0; i < currentIndex; i++) {
+      const until = getRouteCooldownUntil(vendor, i);
+      if (!until || until <= now()) continue;
+      if (!nearestUntil || until < nearestUntil) nearestUntil = until;
+    }
+
+    if (!nearestUntil) return undefined;
+
+    const mins = Math.max(0, Math.ceil((nearestUntil - now()) / 60000));
+    return `preferred route retry ~${mins}m`;
   }
 
-  function schedulePrimaryRetry(ctx: any): void {
-    clearRetryTimer();
-    if (!cfg?.enabled) return;
-    if (!retryPrimaryAfter) return;
-
-    lastCtx = ctx;
-
-    const delayMs = Math.max(0, retryPrimaryAfter - now());
-    retryTimer = setTimeout(() => {
-      void maybeSwitchBackToPrimary("cooldown timer");
-    }, delayMs);
-  }
-
-  async function maybeSwitchBackToPrimary(reason: string): Promise<void> {
-    if (!cfg?.enabled) return;
-
-    // We're about to act; any outstanding pending marker is stale.
-    pendingExtensionSwitch = undefined;
-
-    if (!managedModelId) return;
-
-    const ctx = lastCtx;
-    if (!ctx) return;
-
-    // Don't switch models while the agent is streaming.
-    if (typeof ctx.isIdle === "function" && !ctx.isIdle()) {
-      clearRetryTimer();
-      retryTimer = setTimeout(() => {
-        void maybeSwitchBackToPrimary(reason);
-      }, 30_000);
-      return;
-    }
-
-    const provider = activeProvider ?? ctx.model?.provider;
-    const id = activeModelId ?? ctx.model?.id;
-    if (provider !== cfg.fallbackProvider || id !== managedModelId) {
-      // User likely switched away.
-      clearRetryTimer();
-      retryPrimaryAfter = 0;
-      return;
-    }
-
-    if (retryPrimaryAfter && now() < retryPrimaryAfter) {
-      schedulePrimaryRetry(ctx);
-      return;
-    }
-
-    const targetPrimary = selectBestPrimaryProvider();
-    if (!targetPrimary) {
-      // No primary is currently eligible; schedule the next retry.
-      recomputeRetryPrimaryAfter();
-      schedulePrimaryRetry(ctx);
-      return;
-    }
-
-    if (ctx.hasUI) {
-      ctx.ui.notify(
-        `[${EXT}] Cooldown expired; switching back to subscription (${formatPrimaryProviderLabel(targetPrimary)})…`,
-        "info",
-      );
-    }
-
-    const switched = await switchToProvider(ctx, targetPrimary, reason);
-    if (switched) {
-      clearPrimaryCooldown(targetPrimary);
-      retryPrimaryAfter = 0;
-      clearRetryTimer();
-    } else {
-      // Avoid thrashing if the switch keeps failing (missing creds, etc.)
-      setPrimaryCooldown(targetPrimary, now() + 5 * 60_000);
-
-      if (ctx.hasUI) {
-        ctx.ui.notify(
-          `[${EXT}] Failed to switch back to subscription; will retry in ~5m`,
-          "warning",
-        );
-      }
-
-      schedulePrimaryRetry(ctx);
-    }
-  }
-
-  function updateStatus(ctx: any) {
+  function updateStatus(ctx: any): void {
     if (!ctx.hasUI) return;
 
     if (!cfg?.enabled) {
@@ -803,162 +1145,208 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
       return;
     }
 
-    const provider = activeProvider ?? ctx.model?.provider;
-    const modelId = activeModelId ?? ctx.model?.id;
+    const provider = ctx.model?.provider;
+    const modelId = ctx.model?.id;
     if (!provider || !modelId) {
       ctx.ui.setStatus(EXT, undefined);
       return;
     }
 
-    const fallback = cfg.fallbackProvider;
+    const resolved = resolveVendorRouteForProvider(provider);
+    if (!resolved) {
+      ctx.ui.setStatus(EXT, ctx.ui.theme.fg("muted", `${EXT}:`) + " " + provider + "/" + modelId);
+      return;
+    }
 
-    const mode = isPrimaryProvider(provider) ? "sub" : provider === fallback ? "api" : provider;
+    const route = getRoute(resolved.vendor, resolved.index);
+    if (!route) {
+      ctx.ui.setStatus(EXT, ctx.ui.theme.fg("muted", `${EXT}:`) + " " + provider + "/" + modelId);
+      return;
+    }
 
     let msg = ctx.ui.theme.fg("muted", `${EXT}:`);
-    msg += " " + ctx.ui.theme.fg("accent", mode);
+    msg += " " + ctx.ui.theme.fg("accent", route.auth_type === "oauth" ? "sub" : "api");
+    msg += " " + ctx.ui.theme.fg("dim", `${resolved.vendor}/${route.label}`);
+    msg += " " + ctx.ui.theme.fg("dim", modelId);
 
-    if (managedModelId) {
-      msg += " " + ctx.ui.theme.fg("dim", managedModelId);
-    }
-
-    if (isPrimaryProvider(provider) && primaryProviders.length > 1) {
-      msg += " " + ctx.ui.theme.fg("dim", `(${formatPrimaryProviderLabel(provider)})`);
-    }
-
-    if (provider === fallback && cfg.fallbackProvider === "openai" && fallbackAccounts.length > 1) {
-      const acct = fallbackAccounts[activeFallbackAccountIndex];
-      if (acct) {
-        msg += " " + ctx.ui.theme.fg("dim", `(acct ${resolveAccountLabel(acct, activeFallbackAccountIndex)})`);
-      }
-    }
-
-    if (retryPrimaryAfter && provider === fallback) {
-      const mins = Math.max(0, Math.ceil((retryPrimaryAfter - now()) / 60000));
-      msg += " " + ctx.ui.theme.fg("dim", `(try subscription again in ~${mins}m)`);
-    }
+    const hint = nearestPreferredCooldownHint(resolved.vendor, resolved.index);
+    if (hint) msg += " " + ctx.ui.theme.fg("dim", `(${hint})`);
 
     ctx.ui.setStatus(EXT, msg);
   }
 
-  async function maybePreferPrimaryOnStartup(ctx: any, reason: string): Promise<void> {
-    if (startupPreferPrimaryDone) return;
+  function buildStatusLines(ctx: any): string[] {
+    if (!cfg) return ["(no config loaded)"];
 
-    ensureCfg(ctx);
+    const lines: string[] = [];
+    lines.push(`[${EXT}] enabled=${cfg.enabled} default_vendor=${cfg.default_vendor}`);
 
-    // If the extension is disabled, or startup behavior is disabled, never attempt.
-    if (!cfg?.enabled) {
-      startupPreferPrimaryDone = true;
-      return;
-    }
-    if (cfg.preferPrimaryOnStartup === false) {
-      startupPreferPrimaryDone = true;
-      return;
+    const currentProvider = ctx.model?.provider;
+    const currentModel = ctx.model?.id;
+    if (currentProvider && currentModel) {
+      lines.push(`current_model=${currentProvider}/${currentModel}`);
     }
 
-    rememberActiveFromCtx(ctx);
-
-    const provider = activeProvider ?? ctx.model?.provider;
-    if (!provider) {
-      // We don't yet know what model/provider we restored. Try again when we do.
-      return;
+    for (const v of cfg.vendors) {
+      lines.push(`vendor ${v.vendor}:`);
+      for (let i = 0; i < v.routes.length; i++) {
+        const route = v.routes[i];
+        const active = activeRouteIndexByVendor.get(v.vendor) === i ? "*" : " ";
+        const cooling = isRouteCoolingDown(v.vendor, i)
+          ? `cooldown~${Math.max(0, Math.ceil((getRouteCooldownUntil(v.vendor, i) - now()) / 60000))}m`
+          : "ready";
+        lines.push(
+          `  ${active} ${i + 1}. ${route.auth_type} ${decode(route.label)} (provider=${route.provider_id}, ${cooling})`,
+        );
+      }
     }
 
-    if (isPrimaryProvider(provider)) {
-      startupPreferPrimaryDone = true;
-      return;
+    return lines;
+  }
+
+  function notifyStatus(ctx: any): void {
+    if (!ctx.hasUI) return;
+    for (const line of buildStatusLines(ctx)) {
+      ctx.ui.notify(line, "info");
+    }
+  }
+
+  function configuredOauthProviders(): string[] {
+    if (!cfg) return [];
+    const providers: string[] = [];
+    for (const v of cfg.vendors) {
+      for (const route of v.routes) {
+        if (route.auth_type === "oauth") providers.push(route.provider_id);
+      }
+    }
+    return Array.from(new Set(providers));
+  }
+
+  function findAnyModelForProvider(ctx: any, providerId: string): any | undefined {
+    const currentModelId = ctx.model?.id;
+    if (currentModelId) {
+      const m = ctx.modelRegistry.find(providerId, currentModelId);
+      if (m) return m;
     }
 
-    // Only interfere if we started on the configured fallback provider.
-    if (provider !== cfg.fallbackProvider) {
-      startupPreferPrimaryDone = true;
-      return;
-    }
+    const available = (ctx.modelRegistry.getAvailable?.() ?? []) as any[];
+    return available.find((m) => m?.provider === providerId);
+  }
 
-    managedModelId = managedModelId ?? resolveManagedModelId(ctx);
-    if (!managedModelId) {
-      // Can't switch without a model id that's present in both providers. We'll try again on
-      // model restore/select.
-      return;
-    }
+  async function isOauthProviderAuthenticated(ctx: any, providerId: string): Promise<boolean> {
+    if (!ctx?.modelRegistry?.getApiKey) return false;
 
-    const targetPrimary = selectBestPrimaryProvider() || primaryProviders[0];
-    if (!targetPrimary) {
-      startupPreferPrimaryDone = true;
-      return;
-    }
+    const model = findAnyModelForProvider(ctx, providerId);
+    if (!model) return false;
 
-    startupPreferPrimaryDone = true;
+    try {
+      const apiKey = await ctx.modelRegistry.getApiKey(model);
+      return Boolean(apiKey && String(apiKey).trim());
+    } catch {
+      return false;
+    }
+  }
+
+  async function missingOauthProviders(
+    ctx: any,
+    providers: string[],
+  ): Promise<string[]> {
+    const missing: string[] = [];
+    for (const provider of providers) {
+      const ok = await isOauthProviderAuthenticated(ctx, provider);
+      if (!ok) missing.push(provider);
+    }
+    return missing;
+  }
+
+  async function refreshOauthReminderWidget(
+    ctx: any,
+    providers?: string[],
+  ): Promise<string[]> {
+    const candidates = providers ? Array.from(new Set(providers)) : configuredOauthProviders();
+    const missing = await missingOauthProviders(ctx, candidates);
+    pendingOauthReminderProviders = missing;
 
     if (ctx.hasUI) {
+      if (missing.length === 0) {
+        ctx.ui.setWidget(LOGIN_WIDGET_KEY, undefined);
+      } else {
+        const lines = [
+          "⚠ subswitch setup incomplete: OAuth login required",
+          "Run /login and authenticate providers:",
+          ...missing.map((p) => `  - ${p}`),
+          "Use /subswitch login-status to re-check.",
+        ];
+        ctx.ui.setWidget(LOGIN_WIDGET_KEY, lines, { placement: "belowEditor" });
+      }
+    }
+
+    return missing;
+  }
+
+  async function promptOauthLogin(
+    ctx: any,
+    providers?: string[],
+  ): Promise<void> {
+    const missing = await refreshOauthReminderWidget(ctx, providers);
+    if (missing.length === 0) {
+      if (ctx.hasUI) {
+        ctx.ui.notify(`[${EXT}] OAuth providers already authenticated`, "info");
+      }
+      return;
+    }
+
+    if (!ctx.hasUI) return;
+
+    const choice = await ctx.ui.select("OAuth login required", [
+      "Start /login now",
+      "Remind me later",
+    ]);
+
+    if (choice === "Start /login now") {
+      ctx.ui.setEditorText("/login");
       ctx.ui.notify(
-        `[${EXT}] Startup: switching to subscription (${formatPrimaryProviderLabel(targetPrimary)})…`,
+        `[${EXT}] Prefilled /login. After each login, run /subswitch login-status.`,
+        "warning",
+      );
+    } else {
+      ctx.ui.notify(
+        `[${EXT}] Reminder saved. Run /subswitch login to resume OAuth login flow.`,
         "info",
       );
     }
-
-    await switchToProvider(ctx, targetPrimary, `startup (${reason})`);
   }
 
-  function canManageModelId(ctx: any, modelId: string): boolean {
-    const fallback = cfg?.fallbackProvider;
-    if (!fallback) return false;
-
-    if (!ctx.modelRegistry.find(fallback, modelId)) return false;
-
-    // We only manage switching if the model id exists in ALL configured primary providers.
-    // This keeps behavior predictable when rotating among multiple OAuth accounts.
-    if (primaryProviders.length === 0) return false;
-    for (const p of primaryProviders) {
-      if (!ctx.modelRegistry.find(p, modelId)) return false;
-    }
-
-    return true;
-  }
-
-  function selectAnyManageableModelId(ctx: any): string | undefined {
-    if (!cfg) return undefined;
-
-    const firstPrimary = primaryProviders[0];
-    if (!firstPrimary) return undefined;
-
-    const all = typeof ctx.modelRegistry?.getAll === "function" ? (ctx.modelRegistry.getAll() as any[]) : [];
-
-    for (const m of all) {
-      if (!m || m.provider !== firstPrimary) continue;
-      const id = String(m.id ?? "");
-      if (!id) continue;
-      if (canManageModelId(ctx, id)) return id;
-    }
-
-    return undefined;
-  }
-
-  function resolveManagedModelId(ctx: any): string | undefined {
-    if (!cfg) return undefined;
-
-    if (cfg.modelId) {
-      return canManageModelId(ctx, cfg.modelId) ? cfg.modelId : undefined;
-    }
-
-    const current = ctx.model;
-    if (current?.id && canManageModelId(ctx, current.id)) return current.id;
-
-    // Last resort: pick *some* model id that exists in both providers.
-    return selectAnyManageableModelId(ctx);
-  }
-
-  async function switchToProvider(ctx: any, provider: string, reason: string): Promise<boolean> {
+  async function switchToRoute(
+    ctx: any,
+    vendor: string,
+    routeIndex: number,
+    modelId: string,
+    reason: string,
+    notify = true,
+  ): Promise<boolean> {
     if (!cfg?.enabled) return false;
-    if (!managedModelId) return false;
 
-    lastCtx = ctx;
+    const vendorCfg = getVendor(vendor);
+    const route = getRoute(vendor, routeIndex);
+    if (!vendorCfg || !route) return false;
 
-    if (provider === cfg.fallbackProvider) {
-      const ok = ensureFallbackAccountSelected(ctx, `switching to ${provider}`);
+    if (!routeCanHandleModel(ctx, route, modelId)) {
+      if (notify && ctx.hasUI) {
+        ctx.ui.notify(
+          `[${EXT}] Route cannot serve model ${modelId}: ${routeDisplay(vendor, route)}`,
+          "warning",
+        );
+      }
+      return false;
+    }
+
+    if (route.auth_type === "api_key") {
+      const ok = applyApiRouteCredentials(vendor, route);
       if (!ok) {
-        if (ctx.hasUI) {
+        if (notify && ctx.hasUI) {
           ctx.ui.notify(
-            `[${EXT}] No usable OpenAI fallback account credentials found (check fallbackAccounts/apiKeyEnv/apiKeyPath)`,
+            `[${EXT}] Missing API key material for ${routeDisplay(vendor, route)} (check api_key_env/api_key_path/api_key)`,
             "warning",
           );
         }
@@ -966,13 +1354,18 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
       }
     }
 
-    const model = ctx.modelRegistry.find(provider, managedModelId);
+    const model = ctx.modelRegistry.find(route.provider_id, modelId);
     if (!model) {
-      if (ctx.hasUI) ctx.ui.notify(`[${EXT}] No model ${provider}/${managedModelId} (${reason})`, "warning");
+      if (notify && ctx.hasUI) {
+        ctx.ui.notify(
+          `[${EXT}] No model ${route.provider_id}/${modelId} (${reason})`,
+          "warning",
+        );
+      }
       return false;
     }
 
-    pendingExtensionSwitch = { provider, modelId: managedModelId };
+    pendingExtensionSwitch = { provider: route.provider_id, modelId };
 
     let ok = false;
     try {
@@ -982,205 +1375,1252 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     }
 
     if (!ok) {
-      if (ctx.hasUI) ctx.ui.notify(`[${EXT}] Missing credentials for ${provider}/${managedModelId} (${reason})`, "warning");
+      if (notify && ctx.hasUI) {
+        ctx.ui.notify(
+          `[${EXT}] Missing credentials for ${route.provider_id}/${modelId} (${reason})`,
+          "warning",
+        );
+      }
       return false;
     }
 
-    activeProvider = provider;
-    activeModelId = managedModelId;
+    activeVendor = vendor;
+    activeRouteIndexByVendor.set(vendor, routeIndex);
+    managedModelId = modelId;
 
-    if (isPrimaryProvider(provider)) {
-      clearPrimaryCooldown(provider);
-      retryPrimaryAfter = 0;
-      clearRetryTimer();
-    } else if (provider === cfg.fallbackProvider && retryPrimaryAfter) {
-      schedulePrimaryRetry(ctx);
-    }
-
-    if (ctx.hasUI) {
-      const label = isPrimaryProvider(provider)
-        ? "subscription"
-        : provider === cfg.fallbackProvider
-          ? "API credits"
-          : provider;
-
-      let extra = "";
-      if (provider === cfg.fallbackProvider && cfg.fallbackProvider === "openai" && fallbackAccounts.length > 0) {
-        const acct = fallbackAccounts[activeFallbackAccountIndex];
-        if (acct) {
-          extra = ` (acct ${resolveAccountLabel(acct, activeFallbackAccountIndex)})`;
-        }
-      }
-
-      ctx.ui.notify(`[${EXT}] Switched to ${label}${extra} (${provider}/${managedModelId})`, "info");
+    if (notify && ctx.hasUI) {
+      ctx.ui.notify(
+        `[${EXT}] Switched to ${routeDisplay(vendor, route)} (${route.provider_id}/${modelId})`,
+        "info",
+      );
     }
 
     updateStatus(ctx);
+    scheduleRetryTimer(ctx);
     return true;
   }
 
-  function buildUserMessageContent(text: string, images: any[]): any {
-    if (!images || images.length === 0) return text;
-    return [{ type: "text", text }, ...images];
+  async function useRouteBySelector(
+    ctx: any,
+    vendor: string,
+    authType: AuthType,
+    label: string,
+    modelId?: string,
+    reason = "manual",
+  ): Promise<boolean> {
+    ensureCfg(ctx);
+
+    const v = getVendor(vendor);
+    if (!v) {
+      if (ctx.hasUI) ctx.ui.notify(`[${EXT}] Unknown vendor '${vendor}'`, "warning");
+      return false;
+    }
+
+    const idx = findRouteIndex(vendor, authType, label);
+    if (idx === undefined) {
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          `[${EXT}] No route '${label}' with auth_type='${authType}' for vendor '${vendor}'`,
+          "warning",
+        );
+      }
+      return false;
+    }
+
+    const targetModelId = modelId ?? ctx.model?.id;
+    if (!targetModelId) {
+      if (ctx.hasUI) {
+        ctx.ui.notify(`[${EXT}] No current model selected; specify model id explicitly`, "warning");
+      }
+      return false;
+    }
+
+    return switchToRoute(ctx, vendor, idx, targetModelId, reason, true);
   }
 
-  pi.registerCommand("subswitch", {
-    description: "Subscription↔API model auto-fallback (status/help/reload/force)",
-    handler: async (args, ctx) => {
+  async function useFirstRouteForAuthType(
+    ctx: any,
+    vendor: string,
+    authType: AuthType,
+    label: string | undefined,
+    modelId?: string,
+    reason = "manual",
+  ): Promise<boolean> {
+    ensureCfg(ctx);
+
+    const v = getVendor(vendor);
+    if (!v) {
+      if (ctx.hasUI) ctx.ui.notify(`[${EXT}] Unknown vendor '${vendor}'`, "warning");
+      return false;
+    }
+
+    const targetModelId = modelId ?? ctx.model?.id;
+    if (!targetModelId) {
+      if (ctx.hasUI) {
+        ctx.ui.notify(`[${EXT}] No current model selected; specify model id explicitly`, "warning");
+      }
+      return false;
+    }
+
+    let idx: number | undefined;
+
+    if (label) {
+      idx = findRouteIndex(vendor, authType, label);
+      if (idx === undefined) {
+        if (ctx.hasUI) {
+          ctx.ui.notify(
+            `[${EXT}] No ${authType} route '${label}' for vendor '${vendor}'`,
+            "warning",
+          );
+        }
+        return false;
+      }
+    } else {
+      for (let i = 0; i < v.routes.length; i++) {
+        const route = v.routes[i];
+        if (route.auth_type !== authType) continue;
+        if (!routeEligible(ctx, vendor, i, targetModelId)) continue;
+        idx = i;
+        break;
+      }
+
+      if (idx === undefined) {
+        if (ctx.hasUI) {
+          ctx.ui.notify(
+            `[${EXT}] No eligible ${authType} route for vendor '${vendor}' and model '${targetModelId}'`,
+            "warning",
+          );
+        }
+        return false;
+      }
+    }
+
+    return switchToRoute(ctx, vendor, idx, targetModelId, reason, true);
+  }
+
+  function routeOrderMoveToFront(vendor: string, authType: AuthType, label: string): boolean {
+    const v = getVendor(vendor);
+    if (!v) return false;
+
+    const idx = findRouteIndex(vendor, authType, label);
+    if (idx === undefined) return false;
+
+    const [picked] = v.routes.splice(idx, 1);
+    v.routes.unshift(picked);
+
+    // Reconcile active index if we touched this vendor.
+    const current = activeRouteIndexByVendor.get(vendor);
+    if (current !== undefined) {
+      if (current === idx) {
+        activeRouteIndexByVendor.set(vendor, 0);
+      } else if (current < idx) {
+        activeRouteIndexByVendor.set(vendor, current + 1);
+      }
+    }
+
+    return true;
+  }
+
+  function renameRoute(vendor: string, authType: AuthType, oldLabel: string, newLabel: string): boolean {
+    const idx = findRouteIndex(vendor, authType, oldLabel);
+    if (idx === undefined) return false;
+    const route = getRoute(vendor, idx);
+    if (!route) return false;
+    route.label = newLabel.trim();
+    return true;
+  }
+
+  function saveCurrentConfig(ctx: any): string {
+    const path = preferredWritableConfigPath(ctx.cwd);
+    if (!cfg) return path;
+    writeJson(path, configToJson(cfg));
+    return path;
+  }
+
+  function vendorForCommand(ctx: any, candidate: string | undefined): string {
+    if (candidate && candidate.trim()) return candidate.trim().toLowerCase();
+
+    const provider = ctx.model?.provider;
+    if (provider) {
+      const resolved = resolveVendorRouteForProvider(provider);
+      if (resolved) return resolved.vendor;
+    }
+
+    return cfg?.default_vendor ?? "openai";
+  }
+
+  async function showModelCompatibility(ctx: any, vendor: string): Promise<void> {
+    ensureCfg(ctx);
+
+    const v = getVendor(vendor);
+    if (!v) {
+      if (ctx.hasUI) ctx.ui.notify(`[${EXT}] Unknown vendor '${vendor}'`, "warning");
+      return;
+    }
+
+    const available = ctx.modelRegistry.getAvailable() as any[];
+    const byProvider = new Map<string, Set<string>>();
+
+    for (const m of available) {
+      const p = String(m.provider ?? "");
+      const id = String(m.id ?? "");
+      if (!p || !id) continue;
+      if (!byProvider.has(p)) byProvider.set(p, new Set<string>());
+      byProvider.get(p)?.add(id);
+    }
+
+    let intersection: Set<string> | undefined;
+    for (const route of v.routes) {
+      const ids = byProvider.get(route.provider_id) ?? new Set<string>();
+      if (!intersection) {
+        intersection = new Set(ids);
+      } else {
+        for (const id of Array.from(intersection)) {
+          if (!ids.has(id)) intersection.delete(id);
+        }
+      }
+    }
+
+    const models = Array.from(intersection ?? []).sort();
+
+    if (ctx.hasUI) {
+      ctx.ui.notify(
+        `[${EXT}] Compatible models for vendor '${vendor}' across ${v.routes.length} routes: ${
+          models.length > 0 ? models.join(", ") : "(none)"
+        }`,
+        models.length > 0 ? "info" : "warning",
+      );
+    }
+  }
+
+  async function reorderVendorInteractive(ctx: any, vendorArg?: string): Promise<void> {
+    ensureCfg(ctx);
+    if (!ctx.hasUI) {
+      return;
+    }
+
+    const vendor = vendorForCommand(ctx, vendorArg);
+    const v = getVendor(vendor);
+    if (!v) {
+      ctx.ui.notify(`[${EXT}] Unknown vendor '${vendor}'`, "warning");
+      return;
+    }
+
+    if (v.routes.length < 2) {
+      ctx.ui.notify(`[${EXT}] Vendor '${vendor}' has fewer than 2 routes`, "warning");
+      return;
+    }
+
+    const fromChoices = v.routes.map((r, i) => `${i + 1}. ${routeDisplay(vendor, r)}`);
+    const from = await ctx.ui.select(`Move which route? (${vendor})`, fromChoices);
+    if (!from) return;
+
+    const fromIndex = fromChoices.indexOf(from);
+    if (fromIndex < 0) return;
+
+    const toChoices = v.routes.map((r, i) => `Position ${i + 1}: ${routeDisplay(vendor, r)}`);
+    const to = await ctx.ui.select(`Move to which position? (${vendor})`, toChoices);
+    if (!to) return;
+
+    const toIndex = toChoices.indexOf(to);
+    if (toIndex < 0 || toIndex === fromIndex) return;
+
+    const [picked] = v.routes.splice(fromIndex, 1);
+    v.routes.splice(toIndex, 0, picked);
+
+    const savePath = saveCurrentConfig(ctx);
+    ctx.ui.notify(
+      `[${EXT}] Reordered routes for '${vendor}'. Saved to ${savePath}`,
+      "info",
+    );
+
+    reloadCfg(ctx);
+    updateStatus(ctx);
+  }
+
+  async function editConfigInteractive(ctx: any): Promise<void> {
+    ensureCfg(ctx);
+
+    if (!ctx.hasUI) {
+      return;
+    }
+
+    const path = preferredWritableConfigPath(ctx.cwd);
+
+    const currentJson = existsSync(path)
+      ? readFileSync(path, "utf-8")
+      : JSON.stringify(configToJson(cfg!), null, 2) + "\n";
+
+    const edited = await ctx.ui.editor(`Edit ${path}`, currentJson);
+    if (edited === undefined) return;
+
+    let parsed: Config;
+    try {
+      parsed = JSON.parse(edited) as Config;
+    } catch (e) {
+      ctx.ui.notify(`[${EXT}] Invalid JSON: ${String(e)}`, "error");
+      return;
+    }
+
+    const normalized = normalizeConfig(parsed);
+    if (normalized.vendors.length === 0) {
+      ctx.ui.notify(`[${EXT}] Config must define at least one vendor with routes`, "error");
+      return;
+    }
+
+    writeJson(path, configToJson(normalized));
+    cfg = normalized;
+    registerAliasesFromConfig(cfg);
+
+    ctx.ui.notify(`[${EXT}] Saved config to ${path}`, "info");
+    updateStatus(ctx);
+  }
+
+  function generateOauthProviderId(vendor: string, label: string): string {
+    const slug = slugify(label);
+    if (vendor === "openai") {
+      if (slug === "personal") return "openai-codex";
+      return `openai-codex-${slug || "account"}`;
+    }
+    if (vendor === "claude" || vendor === "anthropic") {
+      if (slug === "personal") return "anthropic";
+      return `anthropic-${slug || "account"}`;
+    }
+    return `${vendor}-${slug || "oauth"}`;
+  }
+
+  function defaultApiEnvVar(vendor: string, label: string): string {
+    const suffix = slugify(label).toUpperCase().replace(/-/g, "_") || "DEFAULT";
+    if (vendor === "openai") return `OPENAI_API_KEY_${suffix}`;
+    if (vendor === "claude" || vendor === "anthropic") return `ANTHROPIC_API_KEY_${suffix}`;
+    return `${vendor.toUpperCase()}_API_KEY_${suffix}`;
+  }
+
+  async function setupWizard(ctx: any): Promise<void> {
+    if (!ctx.hasUI) {
+      return;
+    }
+
+    ctx.ui.notify(`[${EXT}] Starting setup wizard…`, "info");
+
+    type WizardNav = "ok" | "back" | "cancel";
+
+    async function inputWithBack(title: string, placeholder: string): Promise<{ nav: WizardNav; value?: string }> {
+      const raw = await ctx.ui.input(`${title}\nType /back to go to previous screen`, placeholder);
+      if (raw === undefined) return { nav: "cancel" };
+      if (raw.trim().toLowerCase() === "/back") return { nav: "back" };
+      return { nav: "ok", value: raw };
+    }
+
+    async function collectVendor(
+      vendor: "openai" | "claude",
+      existing?: VendorConfig,
+    ): Promise<{ nav: WizardNav; config?: VendorConfig }> {
+      const vendorTitle = titleCase(vendor);
+      const existingRoutes = Array.isArray(existing?.routes) ? existing.routes : [];
+
+      const defaultOauthLabels =
+        existingRoutes
+          .filter((r) => r.auth_type === "oauth")
+          .map((r) => String(r.label ?? "").trim())
+          .filter(Boolean)
+          .join(", ") || (vendor === "openai" ? "work, personal" : "personal");
+
+      const defaultApiLabels =
+        existingRoutes
+          .filter((r) => r.auth_type === "api_key")
+          .map((r) => String(r.label ?? "").trim())
+          .filter(Boolean)
+          .join(", ") || "work";
+
+      const existingApiEnvByLabel = new Map<string, string>();
+      for (const route of existingRoutes) {
+        if (route.auth_type !== "api_key") continue;
+        const label = String(route.label ?? "").trim();
+        if (!label) continue;
+        if (route.api_key_env && String(route.api_key_env).trim()) {
+          existingApiEnvByLabel.set(label, String(route.api_key_env).trim());
+        }
+      }
+
+      let oauthRaw = defaultOauthLabels;
+      let apiRaw = defaultApiLabels;
+
+      while (true) {
+        const oauthRes = await inputWithBack(
+          `${vendorTitle} OAuth account labels (comma-separated, e.g. work, personal)`,
+          oauthRaw,
+        );
+        if (oauthRes.nav === "cancel") return { nav: "cancel" };
+        if (oauthRes.nav === "back") return { nav: "back" };
+        oauthRaw = oauthRes.value ?? "";
+
+        while (true) {
+          const apiRes = await inputWithBack(
+            `${vendorTitle} API key account labels (comma-separated, e.g. work, personal)`,
+            apiRaw,
+          );
+          if (apiRes.nav === "cancel") return { nav: "cancel" };
+          if (apiRes.nav === "back") break;
+          apiRaw = apiRes.value ?? "";
+
+          const oauthLabels = oauthRaw
+            .split(",")
+            .map((s: string) => s.trim())
+            .filter(Boolean);
+          const apiLabels = apiRaw
+            .split(",")
+            .map((s: string) => s.trim())
+            .filter(Boolean);
+
+          const apiEnvByLabel = new Map<string, string>();
+          for (const label of apiLabels) {
+            const existingEnv = existingApiEnvByLabel.get(label);
+            apiEnvByLabel.set(label, existingEnv ?? defaultApiEnvVar(vendor, label));
+          }
+
+          let goBackToApiLabels = false;
+          let idx = 0;
+          while (idx < apiLabels.length) {
+            const label = apiLabels[idx];
+            const envDefault = apiEnvByLabel.get(label) ?? defaultApiEnvVar(vendor, label);
+            const envRes = await inputWithBack(
+              `${vendorTitle} env var for API key '${label}'`,
+              envDefault,
+            );
+            if (envRes.nav === "cancel") return { nav: "cancel" };
+            if (envRes.nav === "back") {
+              if (idx === 0) {
+                goBackToApiLabels = true;
+                break;
+              }
+              idx -= 1;
+              continue;
+            }
+
+            apiEnvByLabel.set(label, (envRes.value ?? "").trim() || envDefault);
+            idx += 1;
+          }
+
+          if (goBackToApiLabels) {
+            continue;
+          }
+
+          const routes: RouteConfig[] = [];
+
+          for (const label of oauthLabels) {
+            routes.push({
+              auth_type: "oauth",
+              label,
+              provider_id: generateOauthProviderId(vendor, label),
+            });
+          }
+
+          for (const label of apiLabels) {
+            routes.push({
+              auth_type: "api_key",
+              label,
+              provider_id: defaultProviderId(vendor, "api_key"),
+              api_key_env: apiEnvByLabel.get(label) ?? defaultApiEnvVar(vendor, label),
+            });
+          }
+
+          if (routes.length === 0) {
+            const emptyChoice = await ctx.ui.select(
+              `No routes configured for ${vendorTitle}.`,
+              ["Retry", "Skip vendor", "← Back", "Cancel"],
+            );
+            if (!emptyChoice || emptyChoice === "Cancel") return { nav: "cancel" };
+            if (emptyChoice === "← Back") return { nav: "back" };
+            if (emptyChoice === "Skip vendor") return { nav: "ok", config: undefined };
+            continue;
+          }
+
+          return {
+            nav: "ok",
+            config: {
+              vendor,
+              routes,
+              oauth_cooldown_minutes: Number(existing?.oauth_cooldown_minutes ?? 180),
+              api_key_cooldown_minutes: Number(existing?.api_key_cooldown_minutes ?? 15),
+              auto_retry: existing?.auto_retry ?? true,
+            },
+          };
+        }
+      }
+    }
+
+    async function orderVendorRoutes(vendor: "openai" | "claude"): Promise<WizardNav> {
+      const vendorCfg = vendorConfigs.get(vendor);
+      if (!vendorCfg || !Array.isArray(vendorCfg.routes)) return "ok";
+      const routes = vendorCfg.routes;
+      if (routes.length <= 1) return "ok";
+
+      const vendorTitle = titleCase(vendor);
+
+      while (true) {
+        const summary = routes
+          .map((r, i) => `${i + 1}. ${String(r.auth_type)} · ${decode(String(r.label ?? ""))}`)
+          .join("\n");
+
+        const orderChoice = await ctx.ui.select(
+          `${vendorTitle} route order (first = preferred failover):\n${summary}`,
+          ["Keep order", "Move route", "← Back", "Cancel"],
+        );
+
+        if (!orderChoice || orderChoice === "Cancel") return "cancel";
+        if (orderChoice === "← Back") return "back";
+        if (orderChoice === "Keep order") return "ok";
+
+        const routeOptions = routes.map(
+          (r, i) => `${i + 1}. ${String(r.auth_type)} · ${decode(String(r.label ?? ""))}`,
+        );
+
+        const fromChoice = await ctx.ui.select(`Move which route? (${vendorTitle})`, [
+          ...routeOptions,
+          "← Back",
+          "Cancel",
+        ]);
+        if (!fromChoice || fromChoice === "Cancel") return "cancel";
+        if (fromChoice === "← Back") continue;
+
+        const fromIndex = routeOptions.indexOf(fromChoice);
+        if (fromIndex < 0) continue;
+
+        const toChoice = await ctx.ui.select(`Move to which position? (${vendorTitle})`, [
+          ...routeOptions,
+          "← Back",
+          "Cancel",
+        ]);
+        if (!toChoice || toChoice === "Cancel") return "cancel";
+        if (toChoice === "← Back") continue;
+
+        const toIndex = routeOptions.indexOf(toChoice);
+        if (toIndex < 0 || toIndex === fromIndex) continue;
+
+        const [picked] = routes.splice(fromIndex, 1);
+        routes.splice(toIndex, 0, picked);
+      }
+    }
+
+    let targetPath = globalConfigPath();
+    let useOpenAI = true;
+    let useClaude = false;
+
+    const existingCfg = cfg ?? loadConfig(ctx.cwd);
+    if (existingCfg.vendors.some((v) => v.vendor === "openai")) useOpenAI = true;
+    if (existingCfg.vendors.some((v) => v.vendor === "claude" || v.vendor === "anthropic")) {
+      useClaude = true;
+    }
+
+    const vendorConfigs = new Map<string, VendorConfig>();
+
+    const existingOpenAI = existingCfg.vendors.find((v) => v.vendor === "openai");
+    if (existingOpenAI) {
+      vendorConfigs.set("openai", {
+        vendor: "openai",
+        routes: existingOpenAI.routes.map((r) => ({
+          auth_type: r.auth_type,
+          label: r.label,
+          provider_id: r.provider_id,
+          api_key_env: r.api_key_env,
+          api_key_path: r.api_key_path,
+          api_key: r.api_key,
+          openai_org_id_env: r.openai_org_id_env,
+          openai_project_id_env: r.openai_project_id_env,
+          cooldown_minutes: r.cooldown_minutes,
+        })),
+        oauth_cooldown_minutes: existingOpenAI.oauth_cooldown_minutes,
+        api_key_cooldown_minutes: existingOpenAI.api_key_cooldown_minutes,
+        auto_retry: existingOpenAI.auto_retry,
+      });
+    }
+
+    const existingClaude = existingCfg.vendors.find((v) => v.vendor === "claude" || v.vendor === "anthropic");
+    if (existingClaude) {
+      vendorConfigs.set("claude", {
+        vendor: "claude",
+        routes: existingClaude.routes.map((r) => ({
+          auth_type: r.auth_type,
+          label: r.label,
+          provider_id: r.provider_id,
+          api_key_env: r.api_key_env,
+          api_key_path: r.api_key_path,
+          api_key: r.api_key,
+          cooldown_minutes: r.cooldown_minutes,
+        })),
+        oauth_cooldown_minutes: existingClaude.oauth_cooldown_minutes,
+        api_key_cooldown_minutes: existingClaude.api_key_cooldown_minutes,
+        auto_retry: existingClaude.auto_retry,
+      });
+    }
+
+    let stage: "dest" | "vendors" | "routes" | "order" | "default" = "dest";
+
+    while (true) {
+      if (stage === "dest") {
+        const destChoice = await ctx.ui.select("Where should subswitch config live?", [
+          `Global (${globalConfigPath()})`,
+          `Project (${projectConfigPath(ctx.cwd)})`,
+          "Cancel",
+        ]);
+
+        if (!destChoice || destChoice === "Cancel") {
+          ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+          return;
+        }
+
+        targetPath = destChoice.startsWith("Project")
+          ? projectConfigPath(ctx.cwd)
+          : globalConfigPath();
+
+        stage = "vendors";
+        continue;
+      }
+
+      if (stage === "vendors") {
+        const choice = await ctx.ui.select("Select vendors to configure", [
+          `OpenAI: ${useOpenAI ? "Yes" : "No"}`,
+          `Claude: ${useClaude ? "Yes" : "No"}`,
+          "Continue",
+          "← Back",
+          "Cancel",
+        ]);
+
+        if (!choice || choice === "Cancel") {
+          ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+          return;
+        }
+
+        if (choice.startsWith("OpenAI:")) {
+          useOpenAI = !useOpenAI;
+          if (!useOpenAI) vendorConfigs.delete("openai");
+          continue;
+        }
+
+        if (choice.startsWith("Claude:")) {
+          useClaude = !useClaude;
+          if (!useClaude) vendorConfigs.delete("claude");
+          continue;
+        }
+
+        if (choice === "← Back") {
+          stage = "dest";
+          continue;
+        }
+
+        if (!useOpenAI && !useClaude) {
+          ctx.ui.notify(`[${EXT}] Select at least one vendor`, "warning");
+          continue;
+        }
+
+        stage = "routes";
+        continue;
+      }
+
+      if (stage === "routes") {
+        if (useOpenAI) {
+          const openaiResult = await collectVendor("openai", vendorConfigs.get("openai"));
+          if (openaiResult.nav === "cancel") {
+            ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+            return;
+          }
+          if (openaiResult.nav === "back") {
+            stage = "vendors";
+            continue;
+          }
+          if (openaiResult.config) vendorConfigs.set("openai", openaiResult.config);
+          else vendorConfigs.delete("openai");
+        }
+
+        if (useClaude) {
+          const claudeResult = await collectVendor("claude", vendorConfigs.get("claude"));
+          if (claudeResult.nav === "cancel") {
+            ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+            return;
+          }
+          if (claudeResult.nav === "back") {
+            stage = "vendors";
+            continue;
+          }
+          if (claudeResult.config) vendorConfigs.set("claude", claudeResult.config);
+          else vendorConfigs.delete("claude");
+        }
+
+        if (vendorConfigs.size === 0) {
+          ctx.ui.notify(`[${EXT}] No routes configured; returning to vendor selection`, "warning");
+          stage = "vendors";
+          continue;
+        }
+
+        stage = "order";
+        continue;
+      }
+
+      if (stage === "order") {
+        if (useOpenAI && vendorConfigs.has("openai")) {
+          const nav = await orderVendorRoutes("openai");
+          if (nav === "cancel") {
+            ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+            return;
+          }
+          if (nav === "back") {
+            stage = "routes";
+            continue;
+          }
+        }
+
+        if (useClaude && vendorConfigs.has("claude")) {
+          const nav = await orderVendorRoutes("claude");
+          if (nav === "cancel") {
+            ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+            return;
+          }
+          if (nav === "back") {
+            stage = "routes";
+            continue;
+          }
+        }
+
+        stage = "default";
+        continue;
+      }
+
+      const vendorNames = Array.from(vendorConfigs.keys());
+      const defaultChoice = await ctx.ui.select("Default vendor", [
+        ...vendorNames,
+        "← Back",
+        "Cancel",
+      ]);
+
+      if (!defaultChoice || defaultChoice === "Cancel") {
+        ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+        return;
+      }
+
+      if (defaultChoice === "← Back") {
+        stage = "order";
+        continue;
+      }
+
+      const out = normalizeConfig({
+        enabled: true,
+        default_vendor: defaultChoice,
+        vendors: vendorNames
+          .map((name) => vendorConfigs.get(name))
+          .filter((v): v is VendorConfig => Boolean(v)),
+        rate_limit_patterns: cfg?.rate_limit_patterns ?? [],
+      });
+
+      writeJson(targetPath, configToJson(out));
+
+      cfg = out;
+      registerAliasesFromConfig(cfg);
+
+      ctx.ui.notify(`[${EXT}] Wrote config to ${targetPath}`, "info");
+
+      const oauthProviders = configuredOauthProviders();
+      if (oauthProviders.length > 0) {
+        await promptOauthLogin(ctx, oauthProviders);
+      }
+
+      updateStatus(ctx);
+      return;
+    }
+  }
+
+  async function runQuickPicker(ctx: any): Promise<void> {
+    if (!ctx.hasUI) {
+      notifyStatus(ctx);
+      return;
+    }
+
+    ensureCfg(ctx);
+
+    const options: string[] = [
+      "Status",
+      "Setup wizard",
+      "OAuth login checklist",
+      "Edit config",
+      "Reorder routes",
+      "Reload config",
+    ];
+
+    for (const v of cfg!.vendors) {
+      for (const route of v.routes) {
+        options.push(`Use: ${routeDisplay(v.vendor, route)}`);
+      }
+    }
+
+    const selected = await ctx.ui.select("subswitch", options);
+    if (!selected) return;
+
+    if (selected === "Status") {
+      notifyStatus(ctx);
+      return;
+    }
+
+    if (selected === "Setup wizard") {
+      await setupWizard(ctx);
+      return;
+    }
+
+    if (selected === "OAuth login checklist") {
+      await promptOauthLogin(ctx, configuredOauthProviders());
+      return;
+    }
+
+    if (selected === "Edit config") {
+      await editConfigInteractive(ctx);
+      return;
+    }
+
+    if (selected === "Reorder routes") {
+      await reorderVendorInteractive(ctx);
+      return;
+    }
+
+    if (selected === "Reload config") {
       reloadCfg(ctx);
-      managedModelId = resolveManagedModelId(ctx);
+      notifyStatus(ctx);
+      updateStatus(ctx);
+      return;
+    }
+
+    if (selected.startsWith("Use: ")) {
+      const payload = selected.slice("Use: ".length);
+      const parts = payload.split(" · ");
+      if (parts.length !== 3) return;
+
+      const vendor = parts[0].trim();
+      const authType = parts[1].trim() as AuthType;
+      const label = parts[2].trim();
+      await useRouteBySelector(ctx, vendor, authType, label, ctx.model?.id, "quick picker");
+    }
+  }
+
+  function toolStatusSummary(ctx: any): string {
+    return buildStatusLines(ctx).join("\n");
+  }
+
+  async function toolPreferRoute(
+    ctx: any,
+    vendor: string,
+    authType: AuthType,
+    label: string,
+    modelId?: string,
+  ): Promise<string> {
+    ensureCfg(ctx);
+
+    const ok = routeOrderMoveToFront(vendor, authType, label);
+    if (!ok) {
+      return `No route found for vendor='${vendor}', auth_type='${authType}', label='${label}'`;
+    }
+
+    const savePath = saveCurrentConfig(ctx);
+
+    const targetModel = modelId ?? ctx.model?.id;
+    if (targetModel) {
+      await useFirstRouteForAuthType(ctx, vendor, authType, label, targetModel, "tool prefer");
+    }
+
+    return `Set ${vendor}/${authType}/${label} as first failover route and saved config to ${savePath}.`;
+  }
+
+  // Register aliases as early as possible (extension load-time).
+  registerAliasesFromConfig(loadConfig(process.cwd()));
+
+  pi.registerTool({
+    name: "subswitch_manage",
+    label: "Subswitch Manage",
+    description:
+      "Manage subscription/api failover routes for vendors (openai/claude). Supports status, use, prefer, rename, reload.",
+    parameters: Type.Object({
+      action: Type.Union([
+        Type.Literal("status"),
+        Type.Literal("use"),
+        Type.Literal("prefer"),
+        Type.Literal("rename"),
+        Type.Literal("reload"),
+      ]),
+      vendor: Type.Optional(Type.String({ description: "Vendor, e.g. openai or claude" })),
+      auth_type: Type.Optional(
+        Type.Union([Type.Literal("oauth"), Type.Literal("api_key")], {
+          description: "Auth type",
+        }),
+      ),
+      label: Type.Optional(Type.String({ description: "Route label, e.g. work/personal" })),
+      model_id: Type.Optional(Type.String({ description: "Optional model id to switch to while applying route" })),
+      old_label: Type.Optional(Type.String({ description: "Old label for rename action" })),
+      new_label: Type.Optional(Type.String({ description: "New label for rename action" })),
+    }),
+    async execute(_toolCallId, params: any, _signal, _onUpdate, ctx) {
+      ensureCfg(ctx);
+      lastCtx = ctx;
+
+      const action = String(params.action ?? "").trim();
+
+      if (action === "status") {
+        const text = toolStatusSummary(ctx);
+        return {
+          content: [{ type: "text", text }],
+          details: { action, ok: true },
+        };
+      }
+
+      if (action === "reload") {
+        reloadCfg(ctx);
+        updateStatus(ctx);
+        const text = `Reloaded config.\n${toolStatusSummary(ctx)}`;
+        return {
+          content: [{ type: "text", text }],
+          details: { action, ok: true },
+        };
+      }
+
+      if (action === "use") {
+        const vendor = String(params.vendor ?? "").trim().toLowerCase();
+        const authType = String(params.auth_type ?? "").trim() as AuthType;
+        const label = String(params.label ?? "").trim();
+        const modelId = params.model_id ? String(params.model_id).trim() : undefined;
+
+        if (!vendor || (authType !== "oauth" && authType !== "api_key") || !label) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  "Missing required args for action=use: vendor, auth_type (oauth|api_key), label",
+              },
+            ],
+            details: { action, ok: false },
+          };
+        }
+
+        const ok = await useRouteBySelector(ctx, vendor, authType, label, modelId, "tool use");
+        return {
+          content: [
+            {
+              type: "text",
+              text: ok
+                ? `Switched to ${vendor}/${authType}/${label}${modelId ? ` with model ${modelId}` : ""}.`
+                : `Failed to switch to ${vendor}/${authType}/${label}.`,
+            },
+          ],
+          details: { action, ok },
+        };
+      }
+
+      if (action === "prefer") {
+        const vendor = String(params.vendor ?? "").trim().toLowerCase();
+        const authType = String(params.auth_type ?? "").trim() as AuthType;
+        const label = String(params.label ?? "").trim();
+        const modelId = params.model_id ? String(params.model_id).trim() : undefined;
+
+        if (!vendor || (authType !== "oauth" && authType !== "api_key") || !label) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  "Missing required args for action=prefer: vendor, auth_type (oauth|api_key), label",
+              },
+            ],
+            details: { action, ok: false },
+          };
+        }
+
+        const text = await toolPreferRoute(ctx, vendor, authType, label, modelId);
+        return {
+          content: [{ type: "text", text }],
+          details: { action, ok: !text.startsWith("No route found") },
+        };
+      }
+
+      if (action === "rename") {
+        const vendor = String(params.vendor ?? "").trim().toLowerCase();
+        const authType = String(params.auth_type ?? "").trim() as AuthType;
+        const oldLabel = String(params.old_label ?? "").trim();
+        const newLabel = String(params.new_label ?? "").trim();
+
+        if (
+          !vendor ||
+          (authType !== "oauth" && authType !== "api_key") ||
+          !oldLabel ||
+          !newLabel
+        ) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  "Missing required args for action=rename: vendor, auth_type (oauth|api_key), old_label, new_label",
+              },
+            ],
+            details: { action, ok: false },
+          };
+        }
+
+        const ok = renameRoute(vendor, authType, oldLabel, newLabel);
+        if (!ok) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Route not found for rename (${vendor}/${authType}/${oldLabel})`,
+              },
+            ],
+            details: { action, ok: false },
+          };
+        }
+
+        const savePath = saveCurrentConfig(ctx);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Renamed route '${oldLabel}' -> '${newLabel}' and saved config to ${savePath}.`,
+            },
+          ],
+          details: { action, ok: true },
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Unknown action '${action}'. Supported: status, use, prefer, rename, reload.`,
+          },
+        ],
+        details: { action, ok: false },
+      };
+    },
+  });
+
+  pi.registerCommand("subswitch", {
+    description:
+      "Vendor/account failover manager (openai/claude). Use /subswitch for quick picker + status.",
+    handler: async (args, ctx) => {
+      ensureCfg(ctx);
+      lastCtx = ctx;
       rememberActiveFromCtx(ctx);
+      managedModelId = ctx.model?.id;
 
       const parts = splitArgs(args || "");
       const cmd = parts[0] ?? "";
 
-      if (cmd === "reload" || cmd === "" || cmd === "help") {
-        if (cmd === "help" && ctx.hasUI) {
+      if (cmd === "" || cmd === "status") {
+        if (cmd === "") {
+          await runQuickPicker(ctx);
+        } else {
+          notifyStatus(ctx);
+        }
+        await refreshOauthReminderWidget(ctx, configuredOauthProviders());
+        updateStatus(ctx);
+        return;
+      }
+
+      if (cmd === "help") {
+        if (ctx.hasUI) {
           const help =
             "Usage: /subswitch [command]\n\n" +
             "Commands:\n" +
-            "  reload | (no args)   Reload config + show status\n" +
-            "  on / off             Enable/disable extension\n" +
-            "  primary [providerId] Force subscription provider (first of primaryProviders by default)\n" +
-            "  fallback             Force API-key provider (default: openai)\n" +
-            "  simulate [mins] [err] Simulate a subscription limit for testing\n" +
-            "  selftest [ms]        Quick self-test (parse + timer + switch-back)";
+            "  (no args)                     Quick picker + status\n" +
+            "  status                        Show status\n" +
+            "  setup                         Guided setup wizard\n" +
+            "  login                         Prompt OAuth login checklist and prefill /login\n" +
+            "  login-status                  Re-check OAuth login completion and update reminder\n" +
+            "  reload                        Reload config\n" +
+            "  on / off                      Enable/disable extension (runtime)\n" +
+            "  use <vendor> <auth_type> <label> [modelId]\n" +
+            "  subscription <vendor> [label] [modelId]\n" +
+            "  api <vendor> [label] [modelId]\n" +
+            "  rename <vendor> <auth_type> <old_label> <new_label>\n" +
+            "  reorder [vendor]              Interactive reorder for vendor routes\n" +
+            "  edit                          Edit JSON config with validation\n" +
+            "  models <vendor>               Show compatible models across routes\n" +
+            "\nCompatibility aliases:\n" +
+            "  primary [label] [modelId]     == subscription <default_vendor> ...\n" +
+            "  fallback [label] [modelId]    == api <default_vendor> ...";
           ctx.ui.notify(help, "info");
         }
-      } else if (cmd === "on") {
-        cfg.enabled = true;
-      } else if (cmd === "off") {
-        cfg.enabled = false;
-        retryPrimaryAfter = 0;
-        clearRetryTimer();
-        restoreOriginalOpenAIEnv();
-        if (ctx.hasUI) ctx.ui.setStatus(EXT, undefined);
-      } else if (cmd === "primary") {
-        const requested = parts[1] ? String(parts[1]).trim() : "";
-        const target = requested || selectBestPrimaryProvider() || primaryProviders[0] || "openai-codex";
+        updateStatus(ctx);
+        return;
+      }
 
-        const switched = await switchToProvider(ctx, target, "forced");
-        if (switched) {
-          retryPrimaryAfter = 0;
-          clearRetryTimer();
+      if (cmd === "setup") {
+        await setupWizard(ctx);
+        updateStatus(ctx);
+        return;
+      }
+
+      if (cmd === "login") {
+        await promptOauthLogin(ctx, configuredOauthProviders());
+        updateStatus(ctx);
+        return;
+      }
+
+      if (cmd === "login-status") {
+        const providers = configuredOauthProviders();
+        const missing = await refreshOauthReminderWidget(ctx, providers);
+        if (ctx.hasUI) {
+          if (missing.length === 0) {
+            ctx.ui.notify(`[${EXT}] OAuth login checklist complete`, "info");
+          } else {
+            ctx.ui.notify(
+              `[${EXT}] Missing OAuth login for: ${missing.join(", ")}`,
+              "warning",
+            );
+          }
         }
-      } else if (cmd === "fallback") {
-        await switchToProvider(ctx, cfg.fallbackProvider!, "forced");
-      } else if (cmd === "simulate") {
-        const mins = parts[1] ? Number(parts[1]) : 1;
-        const safeMins = !Number.isFinite(mins) || mins <= 0 ? 1 : Math.floor(mins);
-        const custom = parts.slice(2).join(" ");
-        const fakeErr =
-          custom || `You have hit your ChatGPT usage limit (pro plan). Try again in ~${safeMins} min.`;
+        updateStatus(ctx);
+        return;
+      }
 
-        const parsedRetryMs = parseRetryAfterMs(fakeErr) ?? safeMins * 60_000;
-        const bufferMs = 1_000;
-        retryPrimaryAfter = now() + parsedRetryMs + bufferMs;
-        schedulePrimaryRetry(ctx);
+      if (cmd === "reload") {
+        reloadCfg(ctx);
+        notifyStatus(ctx);
+        updateStatus(ctx);
+        return;
+      }
+
+      if (cmd === "on") {
+        if (cfg) cfg.enabled = true;
+        if (ctx.hasUI) ctx.ui.notify(`[${EXT}] enabled=true (runtime)`, "info");
+        updateStatus(ctx);
+        return;
+      }
+
+      if (cmd === "off") {
+        if (cfg) cfg.enabled = false;
+        clearRetryTimer();
+        restoreOriginalEnv();
+        pendingOauthReminderProviders = [];
+        if (ctx.hasUI) {
+          ctx.ui.notify(`[${EXT}] enabled=false (runtime)`, "warning");
+          ctx.ui.setStatus(EXT, undefined);
+          ctx.ui.setWidget(LOGIN_WIDGET_KEY, undefined);
+        }
+        return;
+      }
+
+      if (cmd === "use") {
+        const vendor = String(parts[1] ?? "").trim().toLowerCase();
+        const authType = String(parts[2] ?? "").trim() as AuthType;
+        const label = String(parts[3] ?? "").trim();
+        const modelId = parts[4] ? String(parts[4]).trim() : undefined;
+
+        if (!vendor || (authType !== "oauth" && authType !== "api_key") || !label) {
+          if (ctx.hasUI) {
+            ctx.ui.notify(
+              `[${EXT}] Usage: /subswitch use <vendor> <auth_type> <label> [modelId]`,
+              "warning",
+            );
+          }
+          updateStatus(ctx);
+          return;
+        }
+
+        await useRouteBySelector(ctx, vendor, authType, label, modelId, "manual use");
+        updateStatus(ctx);
+        return;
+      }
+
+      if (cmd === "subscription" || cmd === "api") {
+        const authType: AuthType = cmd === "subscription" ? "oauth" : "api_key";
+        const vendor = vendorForCommand(ctx, parts[1]);
+        const label = parts[2] ? String(parts[2]).trim() : undefined;
+        const modelId = parts[3] ? String(parts[3]).trim() : undefined;
+
+        await useFirstRouteForAuthType(ctx, vendor, authType, label, modelId, "manual auth-type");
+        updateStatus(ctx);
+        return;
+      }
+
+      if (cmd === "primary" || cmd === "fallback") {
+        const authType: AuthType = cmd === "primary" ? "oauth" : "api_key";
+        const vendor = cfg?.default_vendor ?? "openai";
+        const label = parts[1] ? String(parts[1]).trim() : undefined;
+        const modelId = parts[2] ? String(parts[2]).trim() : undefined;
 
         if (ctx.hasUI) {
+          const replacement = cmd === "primary" ? "subscription" : "api";
           ctx.ui.notify(
-            `[${EXT}] Simulating subscription limit; switching to API credits. Will try subscription again in ~${safeMins}m`,
+            `[${EXT}] '${cmd}' is deprecated; use '/subswitch ${replacement} ${vendor} ...'`,
             "warning",
           );
         }
 
-        managedModelId = managedModelId ?? resolveManagedModelId(ctx);
-        if (managedModelId && isPrimaryProvider(ctx.model?.provider)) {
-          await switchToProvider(ctx, cfg.fallbackProvider!, "simulated rate limit");
-        }
-      } else if (cmd === "selftest") {
-        if (typeof (ctx as any).waitForIdle === "function") {
-          await (ctx as any).waitForIdle();
-        }
+        await useFirstRouteForAuthType(ctx, vendor, authType, label, modelId, "compat alias");
+        updateStatus(ctx);
+        return;
+      }
 
-        if (!cfg.enabled) {
-          if (ctx.hasUI) ctx.ui.notify(`[${EXT}] Selftest skipped: extension disabled`, "warning");
-        } else if (!managedModelId) {
-          if (ctx.hasUI)
+      if (cmd === "rename") {
+        const vendor = String(parts[1] ?? "").trim().toLowerCase();
+        const authType = String(parts[2] ?? "").trim() as AuthType;
+        const oldLabel = String(parts[3] ?? "").trim();
+        const newLabel = String(parts[4] ?? "").trim();
+
+        if (!vendor || (authType !== "oauth" && authType !== "api_key") || !oldLabel || !newLabel) {
+          if (ctx.hasUI) {
             ctx.ui.notify(
-              `[${EXT}] Selftest skipped: not managing current model id (pick a model present in both providers)`,
+              `[${EXT}] Usage: /subswitch rename <vendor> <auth_type> <old_label> <new_label>`,
               "warning",
             );
-        } else {
-          const msRaw = parts[1] ? Number(parts[1]) : 250;
-          const ms = Number.isFinite(msRaw) && msRaw >= 50 && msRaw <= 5000 ? Math.floor(msRaw) : 250;
-
-          const primary = selectBestPrimaryProvider() || primaryProviders[0] || "openai-codex";
-          await switchToProvider(ctx, primary, "selftest setup");
-
-          const resetAtMs = now() + ms;
-          const fakeErr = `{"resets_at": ${resetAtMs}}`;
-          const parsedRetryMs = parseRetryAfterMs(fakeErr);
-          if (!parsedRetryMs) {
-            if (ctx.hasUI)
-              ctx.ui.notify(`[${EXT}] Selftest failed: couldn't parse retry hint from '${fakeErr}'`, "error");
-          } else {
-            retryPrimaryAfter = now() + parsedRetryMs;
-
-            if (ctx.hasUI) {
-              ctx.ui.notify(
-                `[${EXT}] Selftest: switching to fallback; will try subscription again in ~${Math.max(0, Math.ceil(parsedRetryMs))}ms`,
-                "info",
-              );
-            }
-
-            await switchToProvider(ctx, cfg.fallbackProvider!, "selftest simulated rate limit");
-
-            setTimeout(() => {
-              const provider = activeProvider ?? lastCtx?.model?.provider;
-              const ok = isPrimaryProvider(provider);
-              if (lastCtx?.hasUI) {
-                lastCtx.ui.notify(
-                  `[${EXT}] Selftest ${ok ? "PASS" : "FAIL"}: active=${provider ?? "unknown"} managedId=${managedModelId}`,
-                  ok ? "info" : "warning",
-                );
-              }
-            }, ms + 500);
           }
+          updateStatus(ctx);
+          return;
         }
-      } else {
+
+        const ok = renameRoute(vendor, authType, oldLabel, newLabel);
+        if (!ok) {
+          if (ctx.hasUI) {
+            ctx.ui.notify(
+              `[${EXT}] Route not found for rename (${vendor}/${authType}/${oldLabel})`,
+              "warning",
+            );
+          }
+          updateStatus(ctx);
+          return;
+        }
+
+        const savePath = saveCurrentConfig(ctx);
         if (ctx.hasUI) {
-          const help =
-            "Usage: /subswitch [command]\n\n" +
-            "Commands:\n" +
-            "  reload | (no args)   Reload config + show status\n" +
-            "  on / off             Enable/disable extension\n" +
-            "  primary [providerId] Force subscription provider (first of primaryProviders by default)\n" +
-            "  fallback             Force API-key provider (default: openai)\n" +
-            "  simulate [mins] [err] Simulate a subscription limit for testing\n" +
-            "  selftest [ms]        Quick self-test (parse + timer + switch-back)";
-          ctx.ui.notify(help, "info");
+          ctx.ui.notify(
+            `[${EXT}] Renamed route '${oldLabel}' -> '${newLabel}'. Saved to ${savePath}`,
+            "info",
+          );
         }
+
+        reloadCfg(ctx);
+        updateStatus(ctx);
+        return;
+      }
+
+      if (cmd === "reorder") {
+        await reorderVendorInteractive(ctx, parts[1]);
+        updateStatus(ctx);
+        return;
+      }
+
+      if (cmd === "edit") {
+        await editConfigInteractive(ctx);
+        updateStatus(ctx);
+        return;
+      }
+
+      if (cmd === "models") {
+        const vendor = vendorForCommand(ctx, parts[1]);
+        await showModelCompatibility(ctx, vendor);
+        updateStatus(ctx);
+        return;
       }
 
       if (ctx.hasUI) {
-        const provider = activeProvider ?? ctx.model?.provider;
-        const modelId = activeModelId ?? ctx.model?.id;
-        const model = provider && modelId ? `${provider}/${modelId}` : "(none)";
-        const managed = managedModelId
-          ? managedModelId
-          : "(not managing - pick a model that exists in both providers)";
-        const active =
-          !provider
-            ? "none"
-            : isPrimaryProvider(provider)
-              ? "primary"
-              : provider === cfg.fallbackProvider
-                ? "fallback"
-                : `other:${provider}`;
-
-        const acctInfo =
-          provider === cfg.fallbackProvider && cfg.fallbackProvider === "openai" && fallbackAccounts.length > 0
-            ? ` acct=${resolveAccountLabel(fallbackAccounts[activeFallbackAccountIndex], activeFallbackAccountIndex)}`
-            : "";
-
-        ctx.ui.notify(
-          `[${EXT}] enabled=${cfg.enabled} active=${active}${acctInfo} primaries=[${primaryProviders.join(",")}] fallback=${cfg.fallbackProvider} model=${model} managedId=${managed}`,
-          "info",
-        );
+        ctx.ui.notify(`[${EXT}] Unknown command '${cmd}'. Try '/subswitch help'.`, "warning");
       }
-
       updateStatus(ctx);
     },
   });
@@ -1193,20 +2633,9 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     ensureCfg(ctx);
     if (!cfg?.enabled) return;
 
-    await maybePreferPrimaryOnStartup(ctx, "before agent start");
-
+    lastCtx = ctx;
     rememberActiveFromCtx(ctx);
-
-    // If we're already on the fallback provider, make sure the selected account is applied.
-    if ((activeProvider ?? ctx.model?.provider) === cfg.fallbackProvider) {
-      ensureFallbackAccountSelected(ctx, "before agent start");
-    }
-
-    managedModelId = managedModelId ?? resolveManagedModelId(ctx);
-    if (!managedModelId) {
-      updateStatus(ctx);
-      return;
-    }
+    managedModelId = ctx.model?.id;
 
     lastPrompt = {
       source: pendingInputSource ?? "interactive",
@@ -1215,14 +2644,8 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     };
     pendingInputSource = undefined;
 
-    rememberActiveFromCtx(ctx);
-
-    if (retryPrimaryAfter && now() >= retryPrimaryAfter) {
-      await maybeSwitchBackToPrimary("cooldown expired");
-    } else if (retryPrimaryAfter) {
-      schedulePrimaryRetry(ctx);
-    }
-
+    await maybePromotePreferredRoute(ctx, "before turn");
+    scheduleRetryTimer(ctx);
     updateStatus(ctx);
   });
 
@@ -1231,8 +2654,9 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
     if (!cfg?.enabled) return;
 
     lastCtx = ctx;
-    activeProvider = event.model?.provider;
-    activeModelId = event.model?.id;
+
+    const activeProvider = event.model?.provider;
+    const activeModelId = event.model?.id;
 
     const isExtensionSwitch =
       pendingExtensionSwitch !== undefined &&
@@ -1241,226 +2665,149 @@ export default function subscriptionFallback(pi: ExtensionAPI) {
 
     if (isExtensionSwitch) {
       pendingExtensionSwitch = undefined;
-
-      if (isPrimaryProvider(activeProvider)) {
-        retryPrimaryAfter = 0;
-        clearRetryTimer();
-      } else if (activeProvider === cfg.fallbackProvider && retryPrimaryAfter) {
-        schedulePrimaryRetry(ctx);
-      }
-
+      rememberActiveFromCtx(ctx);
+      managedModelId = activeModelId;
+      scheduleRetryTimer(ctx);
+      await refreshOauthReminderWidget(ctx, configuredOauthProviders());
       updateStatus(ctx);
       return;
     }
 
-    if (cfg.modelId) {
-      updateStatus(ctx);
-      return;
-    }
-
-    if (activeProvider && activeProvider !== cfg.fallbackProvider) {
-      retryPrimaryAfter = 0;
-      clearRetryTimer();
-    } else if (retryPrimaryAfter) {
-      schedulePrimaryRetry(ctx);
-    }
-
-    const id = event.model?.id;
-    if (id && canManageModelId(ctx, id)) {
-      managedModelId = id;
-      retryPrimaryAfter = 0;
-      clearRetryTimer();
-    }
-
-    if (activeProvider === cfg.fallbackProvider) {
-      ensureFallbackAccountSelected(ctx, "model select");
-    }
-
+    managedModelId = activeModelId;
+    rememberActiveFromCtx(ctx);
+    scheduleRetryTimer(ctx);
+    await refreshOauthReminderWidget(ctx, configuredOauthProviders());
     updateStatus(ctx);
-  });
-
-  pi.on("context", async (event, ctx) => {
-    ensureCfg(ctx);
-    if (!cfg?.enabled) return;
-
-    // Mitigation for OpenAI Responses API:
-    // OpenAI rejects replaying prior reasoning items by id (rs_...) when `store` is false
-    // (which is the default for many setups). This can wedge a session with repeated 404s.
-    //
-    // The root fix belongs in @mariozechner/pi-ai (convertResponsesMessages should not
-    // replay reasoning items when store=false), but we can avoid the wedge here by stripping
-    // thinking blocks before they are converted into Responses input items.
-    const model = ctx.model;
-    if (!model) return;
-    if (model.api !== "openai-responses") return;
-
-    // Only apply to the fallback provider (typically "openai").
-    if (model.provider !== cfg.fallbackProvider) return;
-
-    let changed = false;
-    for (const m of event.messages) {
-      if (m.role !== "assistant") continue;
-      const content = (m as any).content;
-      if (!Array.isArray(content)) continue;
-
-      const filtered = content.filter((b: any) => b?.type !== "thinking");
-      if (filtered.length !== content.length) {
-        (m as any).content = filtered;
-        changed = true;
-      }
-    }
-
-    if (changed) return { messages: event.messages };
   });
 
   pi.on("turn_end", async (event, ctx) => {
     ensureCfg(ctx);
     if (!cfg?.enabled) return;
 
+    lastCtx = ctx;
     rememberActiveFromCtx(ctx);
 
-    if (!managedModelId) return;
+    const message: any = event.message;
+    if (message?.stopReason !== "error") return;
 
-    const msg: any = event.message;
-    const stopReason = msg?.stopReason;
-    if (stopReason !== "error") return;
-
-    const err = msg?.errorMessage ?? msg?.details?.error ?? msg?.error ?? "unknown error";
+    const err = message?.errorMessage ?? message?.details?.error ?? message?.error ?? "unknown error";
+    if (!isRateLimitError(err, cfg.rate_limit_patterns)) return;
 
     const provider = ctx.model?.provider;
-    const id = ctx.model?.id;
+    const modelId = ctx.model?.id;
+    if (!provider || !modelId) return;
 
-    if (!provider || !id) return;
-    if (id !== managedModelId) return;
+    const resolved = resolveVendorRouteForProvider(provider);
+    if (!resolved) return;
 
-    if (!isRateLimitError(err, cfg.rateLimitPatterns)) return;
+    const vendorCfg = getVendor(resolved.vendor);
+    const route = getRoute(resolved.vendor, resolved.index);
+    if (!vendorCfg || !route) return;
 
-    // 1) Primary (OAuth) provider hit usage/rate limits -> try other primaries, else use API credits
-    if (isPrimaryProvider(provider)) {
-      const parsedRetryMs = parseRetryAfterMs(err);
-      const cooldownMs = (cfg.cooldownMinutes ?? 180) * 60_000;
-      const bufferMs = 15_000;
-      const until = now() + (parsedRetryMs ?? cooldownMs) + bufferMs;
+    const parsedRetryMs = parseRetryAfterMs(err);
+    const defaultCooldownMs = routeDefaultCooldownMinutes(vendorCfg, route) * 60_000;
+    const bufferMs = route.auth_type === "oauth" ? 15_000 : 5_000;
+    const until = now() + (parsedRetryMs ?? defaultCooldownMs) + bufferMs;
 
-      setPrimaryCooldown(provider, until);
-      schedulePrimaryRetry(ctx);
+    setRouteCooldownUntil(resolved.vendor, resolved.index, until);
 
-      const nextPrimary = selectNextPrimaryProvider(provider);
-      if (nextPrimary) {
-        if (ctx.hasUI) {
-          const source = parsedRetryMs !== undefined ? "(from provider reset hint)" : "(from configured cooldown)";
-          ctx.ui.notify(
-            `[${EXT}] Subscription appears rate-limited (${formatPrimaryProviderLabel(provider)}); switching to ${formatPrimaryProviderLabel(nextPrimary)}… ${source}`,
-            "warning",
-          );
-        }
-
-        const switched = await switchToProvider(ctx, nextPrimary, "rate limited");
-        updateStatus(ctx);
-
-        if (switched && cfg.autoRetry && lastPrompt && lastPrompt.source !== "extension") {
-          const content = buildUserMessageContent(lastPrompt.text, lastPrompt.images);
-          if (typeof ctx.isIdle === "function" && ctx.isIdle()) {
-            pi.sendUserMessage(content);
-          } else {
-            pi.sendUserMessage(content, { deliverAs: "followUp" });
-          }
-        }
-
-        return;
-      }
-
-      // No other primary is configured/available; fall back to API credits.
+    const nextIdx = selectNextRouteIndexForFailover(ctx, resolved.vendor, modelId, resolved.index);
+    if (nextIdx === undefined) {
       if (ctx.hasUI) {
-        const mins = Math.max(0, Math.ceil((retryPrimaryAfter - now()) / 60000));
-        const source = parsedRetryMs !== undefined ? "(from provider reset hint)" : "(from configured cooldown)";
+        const mins = Math.max(0, Math.ceil((until - now()) / 60000));
         ctx.ui.notify(
-          `[${EXT}] Subscription appears rate-limited; switching to API credits… Will try subscription again in ~${mins}m ${source}`,
+          `[${EXT}] ${routeDisplay(resolved.vendor, route)} appears rate-limited; no eligible next route for model '${modelId}' (retry ~${mins}m)`,
           "warning",
         );
       }
-
-      const switched = await switchToProvider(ctx, cfg.fallbackProvider!, "rate limited");
-      if (!switched) return;
-
-      if (cfg.autoRetry && lastPrompt && lastPrompt.source !== "extension") {
-        const content = buildUserMessageContent(lastPrompt.text, lastPrompt.images);
-        if (typeof ctx.isIdle === "function" && ctx.isIdle()) {
-          pi.sendUserMessage(content);
-        } else {
-          pi.sendUserMessage(content, { deliverAs: "followUp" });
-        }
-      }
-
+      scheduleRetryTimer(ctx);
+      updateStatus(ctx);
       return;
     }
 
-    // 2) Fallback provider (openai) also got throttled -> rotate between multiple accounts
-    if (provider === cfg.fallbackProvider && cfg.fallbackProvider === "openai" && fallbackAccounts.length > 1) {
-      const parsedRetryMs = parseRetryAfterMs(err);
-      const cooldownMs = (cfg.fallbackAccountCooldownMinutes ?? 15) * 60_000;
-      const bufferMs = 5_000;
-      const until = now() + (parsedRetryMs ?? cooldownMs) + bufferMs;
-
-      // Mark current account as cooled down.
-      if (activeFallbackAccountIndex >= 0 && activeFallbackAccountIndex < fallbackAccounts.length) {
-        fallbackAccountRetryAfter[activeFallbackAccountIndex] = until;
-      }
-
-      const nextIdx = selectNextFallbackAccountIndex(activeFallbackAccountIndex + 1);
-      if (nextIdx === undefined || nextIdx === activeFallbackAccountIndex) {
-        if (ctx.hasUI) {
-          const mins = Math.max(0, Math.ceil((until - now()) / 60000));
-          ctx.ui.notify(
-            `[${EXT}] API credits appear rate-limited and no other configured OpenAI account is available (next retry ~${mins}m)`,
-            "warning",
-          );
-        }
-        updateStatus(ctx);
-        return;
-      }
-
-      const ok = activateFallbackAccount(ctx, nextIdx, "rotating after rate limit", false);
-      if (!ok) {
-        updateStatus(ctx);
-        return;
-      }
-
-      if (ctx.hasUI) {
-        const label = resolveAccountLabel(fallbackAccounts[nextIdx], nextIdx);
-        const hint = parsedRetryMs !== undefined ? "(from provider retry hint)" : "(from configured cooldown)";
-        ctx.ui.notify(`[${EXT}] API credits rate-limited; switching OpenAI account to '${label}' ${hint}`, "warning");
-      }
-
-      updateStatus(ctx);
-
-      // NOTE: We intentionally do not auto-resend the prompt here.
-      // pi itself may have auto-retry enabled; resending here would double-send.
+    const nextRoute = getRoute(resolved.vendor, nextIdx)!;
+    if (ctx.hasUI) {
+      const source = parsedRetryMs !== undefined ? "provider retry hint" : "configured cooldown";
+      ctx.ui.notify(
+        `[${EXT}] ${routeDisplay(resolved.vendor, route)} rate-limited; switching to ${routeDisplay(resolved.vendor, nextRoute)} (${source})`,
+        "warning",
+      );
     }
+
+    const switched = await switchToRoute(
+      ctx,
+      resolved.vendor,
+      nextIdx,
+      modelId,
+      "rate limited",
+      true,
+    );
+
+    if (!switched) {
+      scheduleRetryTimer(ctx);
+      updateStatus(ctx);
+      return;
+    }
+
+    // Auto-retry only when moving from OAuth to API key route and vendor policy allows it.
+    if (
+      route.auth_type === "oauth" &&
+      nextRoute.auth_type === "api_key" &&
+      vendorCfg.auto_retry &&
+      lastPrompt &&
+      lastPrompt.source !== "extension"
+    ) {
+      const content =
+        !lastPrompt.images || lastPrompt.images.length === 0
+          ? lastPrompt.text
+          : [{ type: "text", text: lastPrompt.text }, ...lastPrompt.images];
+
+      if (typeof ctx.isIdle === "function" && ctx.isIdle()) {
+        pi.sendUserMessage(content);
+      } else {
+        pi.sendUserMessage(content, { deliverAs: "followUp" });
+      }
+    }
+
+    scheduleRetryTimer(ctx);
+    updateStatus(ctx);
   });
 
   pi.on("session_start", async (_event, ctx) => {
     reloadCfg(ctx);
-    managedModelId = resolveManagedModelId(ctx);
+    lastCtx = ctx;
     rememberActiveFromCtx(ctx);
+    managedModelId = ctx.model?.id;
 
-    await maybePreferPrimaryOnStartup(ctx, "session start");
-
-    // If the session starts on the fallback provider, make sure the selected account is applied.
-    if (cfg?.enabled && (activeProvider ?? ctx.model?.provider) === cfg.fallbackProvider) {
-      ensureFallbackAccountSelected(ctx, "session start");
+    // If we start on an api_key route we might need to apply env material now.
+    const provider = ctx.model?.provider;
+    if (provider) {
+      const resolved = resolveVendorRouteForProvider(provider);
+      if (resolved) {
+        const route = getRoute(resolved.vendor, resolved.index);
+        if (route?.auth_type === "api_key") {
+          applyApiRouteCredentials(resolved.vendor, route);
+        }
+      }
     }
 
-    clearRetryTimer();
-    if (retryPrimaryAfter) {
-      schedulePrimaryRetry(ctx);
-    }
+    scheduleRetryTimer(ctx);
+    await refreshOauthReminderWidget(ctx, configuredOauthProviders());
+    updateStatus(ctx);
+  });
 
+  pi.on("session_switch", async (_event, ctx) => {
+    reloadCfg(ctx);
+    lastCtx = ctx;
+    rememberActiveFromCtx(ctx);
+    managedModelId = ctx.model?.id;
+    scheduleRetryTimer(ctx);
+    await refreshOauthReminderWidget(ctx, configuredOauthProviders());
     updateStatus(ctx);
   });
 
   pi.on("session_shutdown", async () => {
     clearRetryTimer();
-    restoreOriginalOpenAIEnv();
+    restoreOriginalEnv();
   });
 }

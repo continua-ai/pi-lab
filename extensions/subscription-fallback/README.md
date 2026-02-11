@@ -1,13 +1,14 @@
 # subscription-fallback (pi extension)
 
-Automatically switches between:
+`/subswitch` is a vendor/account failover manager for pi.
 
-- **ChatGPT subscription** via `openai-codex` (authenticated with `pi /login`), and
-- **OpenAI API credits** via `openai` (authenticated with `OPENAI_API_KEY`)
+It supports:
 
-…when the subscription provider hits rate limits / usage limits.
-
-If you have **multiple ChatGPT OAuth accounts**, you can configure multiple primary providers (aliases) and the extension will try all of them before falling back to API credits.
+- multiple vendors (v1: `openai`, `claude`)
+- multiple auth routes per vendor (`oauth`, `api_key`)
+- ordered failover (route order in config)
+- model policy `follow_current` (v1 only)
+- an LLM-callable bridge tool: `subswitch_manage`
 
 ## Install
 
@@ -24,132 +25,161 @@ mkdir -p ~/.pi/agent/extensions/subscription-fallback
 cp -r extensions/subscription-fallback/index.ts ~/.pi/agent/extensions/subscription-fallback/index.ts
 ```
 
-## Prerequisites
+## Config paths
 
-- Subscription provider: run `pi`, then `/login` (default provider name used by this extension: `openai-codex`).
-- API credits provider: set `OPENAI_API_KEY` in your environment (or configure `fallbackAccounts` to rotate between multiple keys).
+Config is loaded and merged in this order:
 
-## Commands
+1. Global: `~/.pi/agent/subswitch.json`
+2. Project: `./.pi/subswitch.json`
 
-All control is via the `/subswitch` command.
+Project entries override global entries by vendor.
 
-- `/subswitch` or `/subswitch reload`
-  - Reload config from disk and print current status.
+Backward compatibility:
 
-- `/subswitch on` / `/subswitch off`
-  - Enable/disable the extension.
+- If no `subswitch.json` exists, the extension will attempt to migrate legacy
+  `subscription-fallback.json` shape (OpenAI-only) at runtime.
 
-- `/subswitch primary [providerId]`
-  - Force switch to a subscription provider (defaults to the first of `primaryProviders`, or `openai-codex`).
+## Config schema (v1)
 
-- `/subswitch fallback`
-  - Force switch to API-key provider (default: `openai`).
-
-- `/subswitch simulate [minutes] [errorText...]`
-  - Simulate a subscription usage-limit error and trigger the fallback path.
-
-- `/subswitch selftest [ms]`
-  - Lightweight manual self-test that exercises parsing a retry hint, scheduling the cooldown timer,
-    switching to fallback, and switching back.
-
-## Configuration
-
-Config is loaded from JSON, merged in this order:
-
-1. **Global**: `~/.pi/agent/subscription-fallback.json`
-2. **Project-local**: `./.pi/subscription-fallback.json`
-
-Project-local values override global.
-
-### Example
+- `vendors[].routes[]` order is the failover order.
+- `auth_type` is `oauth` or `api_key`.
+- `provider_id` is the underlying pi provider id.
 
 ```json
 {
   "enabled": true,
-  "primaryProvider": "openai-codex",
-  "fallbackProvider": "openai",
-  "modelId": "gpt-5.2",
-  "cooldownMinutes": 180,
-  "autoRetry": true,
-  "preferPrimaryOnStartup": true,
-  "rateLimitPatterns": [
-    "You have hit your ChatGPT usage limit"
+  "default_vendor": "openai",
+  "rate_limit_patterns": [],
+  "vendors": [
+    {
+      "vendor": "openai",
+      "oauth_cooldown_minutes": 180,
+      "api_key_cooldown_minutes": 15,
+      "auto_retry": true,
+      "routes": [
+        { "auth_type": "oauth", "label": "work", "provider_id": "openai-codex-work" },
+        { "auth_type": "oauth", "label": "personal", "provider_id": "openai-codex" },
+        {
+          "auth_type": "api_key",
+          "label": "work",
+          "provider_id": "openai",
+          "api_key_env": "OPENAI_API_KEY_WORK",
+          "openai_org_id_env": "OPENAI_ORG_ID_WORK",
+          "openai_project_id_env": "OPENAI_PROJECT_ID_WORK"
+        },
+        {
+          "auth_type": "api_key",
+          "label": "personal",
+          "provider_id": "openai",
+          "api_key_env": "OPENAI_API_KEY_PERSONAL"
+        }
+      ]
+    },
+    {
+      "vendor": "claude",
+      "oauth_cooldown_minutes": 180,
+      "api_key_cooldown_minutes": 15,
+      "auto_retry": true,
+      "routes": [
+        { "auth_type": "oauth", "label": "personal", "provider_id": "anthropic" },
+        { "auth_type": "oauth", "label": "work", "provider_id": "anthropic-work" },
+        {
+          "auth_type": "api_key",
+          "label": "work",
+          "provider_id": "anthropic-api",
+          "api_key_env": "ANTHROPIC_API_KEY_WORK"
+        }
+      ]
+    }
   ]
 }
 ```
 
-Notes:
+## Commands
 
-- `preferPrimaryOnStartup` (default: `true`): if pi restores your last model on the fallback provider (API-key mode), the extension will immediately try to switch back to a subscription provider on startup.
-- `autoRetry` (default: `true`): if the active subscription provider is rate-limited and the extension switches to another provider, it will automatically re-send your last prompt.
-- OpenAI Responses API mitigation: when the fallback provider uses `openai-responses`, the extension strips prior thinking blocks from the request context to avoid repeated 404s for non-persisted `rs_...` items.
+All control is via `/subswitch`.
 
-### Multiple ChatGPT OAuth accounts (subscription aliases)
+- `/subswitch`
+  - Quick picker + status.
 
-pi stores OAuth credentials **per provider id**.
+- `/subswitch status`
+  - Show detailed status.
 
-To avoid a confusing extra "Codex" profile, this extension treats the built-in `openai-codex` provider as your **personal** account, and registers a single additional alias provider for your **work** account:
+- `/subswitch setup`
+  - Guided setup wizard (supports Back via `← Back` and `/back` on inputs, includes route-order step, and drives OAuth login checklist).
 
-- `openai-codex` (personal)
-- `openai-codex-work` (work)
+- `/subswitch login`
+  - Show OAuth login checklist and optionally prefill `/login`.
 
-Log into both:
+- `/subswitch login-status`
+  - Re-check which OAuth providers still need login and update reminder widget.
 
-- `/login` → select **ChatGPT Plus/Pro (Codex Subscription) (personal)**
-- `/login` → select **ChatGPT Plus/Pro (Codex Subscription) (work)**
+- `/subswitch reload`
+  - Reload config from disk.
 
-Then configure `primaryProviders` so `/subswitch` can rotate between them:
+- `/subswitch on` / `/subswitch off`
+  - Enable/disable extension in the current session.
 
-```json
-{
-  "primaryProviders": ["openai-codex-work", "openai-codex"],
-  "fallbackProvider": "openai",
-  "cooldownMinutes": 180
-}
-```
+- `/subswitch use <vendor> <auth_type> <label> [modelId]`
+  - Force a specific route.
 
-Behavior:
+- `/subswitch subscription <vendor> [label] [modelId]`
+  - Use oauth route (first eligible route if no label).
 
-- If the active subscription account gets rate-limited, `/subswitch` will try the other subscription account first.
-- Only if **all** subscription accounts are cooling down will it switch to API credits.
-- When cooling down, it periodically tries to switch back to **any** available subscription account.
+- `/subswitch api <vendor> [label] [modelId]`
+  - Use api-key route (first eligible route if no label).
 
-Note: adding new alias provider ids requires restarting pi (provider registration happens at extension load time).
+- `/subswitch rename <vendor> <auth_type> <old_label> <new_label>`
+  - Rename a route label and persist config.
 
-### Multiple OpenAI accounts (API key rotation)
+- `/subswitch reorder [vendor]`
+  - Interactive route reorder; persists config.
 
-If your **fallback provider is `openai`** and you have multiple OpenAI API keys, you can configure the extension to rotate between them when one key gets throttled (429 / rate limit).
+- `/subswitch edit`
+  - Edit JSON config with validation.
 
-1) Put each key in its own env var (example):
+- `/subswitch models <vendor>`
+  - Show model ids available across all routes for the vendor.
 
-```bash
-export OPENAI_API_KEY_PERSONAL='...'
-export OPENAI_API_KEY_WORK='...'
-```
+Compatibility aliases:
 
-2) Configure `fallbackAccounts` to reference those env vars:
+- `/subswitch primary ...` -> `subscription` (deprecated)
+- `/subswitch fallback ...` -> `api` (deprecated)
 
-```json
-{
-  "fallbackProvider": "openai",
-  "fallbackAccounts": [
-    { "name": "personal", "apiKeyEnv": "OPENAI_API_KEY_PERSONAL" },
-    { "name": "work", "apiKeyEnv": "OPENAI_API_KEY_WORK" }
-  ],
-  "fallbackAccountCooldownMinutes": 15
-}
-```
+## LLM-callable tool bridge
 
-Notes:
+The extension registers a tool:
 
-- The extension switches the **process** `OPENAI_API_KEY` at runtime (it does not print keys).
-- Rotation is only attempted when `fallbackAccounts.length > 1`.
-- The extension does **not** auto-resend on fallback-key rotation (pi core may already be auto-retrying failed calls).
-- When `fallbackAccounts` are configured, the extension also clears `OPENAI_ORG_ID` / `OPENAI_PROJECT_ID` unless you provide `openaiOrgIdEnv` / `openaiProjectIdEnv` per account.
+- `subswitch_manage`
 
-## Notes / limitations
+Supported actions:
 
-- Switching back to subscription happens when pi is idle; the extension avoids changing models mid-stream.
-- If switching back fails (credentials/provider issues), the extension backs off for ~5 minutes and retries.
-- The extension only manages switching when the chosen model id exists in both providers.
-- "Context window exceeded" errors do **not** trigger fallback switching (they are not quota/rate-limit).
+- `status`
+- `reload`
+- `use`
+- `prefer` (move route to front of failover order, then optionally switch)
+- `rename`
+
+This allows natural-language requests like:
+
+- “Make work the primary for gpt-5.2”
+
+…to be executed by the agent via tool calls.
+
+## Provider aliases
+
+Some ids are built-in (`openai`, `openai-codex`, `anthropic`), but the extension can register aliases such as:
+
+- `openai-codex-work` (OpenAI OAuth alias)
+- `my-codex-work` (OpenAI OAuth alias with a custom id)
+- `anthropic-work` (Claude OAuth alias)
+- `anthropic-api` (Claude API-key alias)
+
+Alias ids are meaningful: OAuth credentials are stored per provider id in `~/.pi/agent/auth.json`.
+Use stable ids; changing ids usually requires re-login for that route.
+
+## Notes
+
+- v1 model policy is `follow_current`: `/subswitch` follows whichever model you selected with `/model`.
+- Failover only happens when the current model exists on the candidate route.
+- Quota/rate-limit detection intentionally ignores context-window errors.
