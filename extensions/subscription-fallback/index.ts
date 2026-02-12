@@ -2067,7 +2067,7 @@ export default function (pi: ExtensionAPI): void {
     }
 
     let msg = ctx.ui.theme.fg("muted", `${EXT}:`);
-    msg += " " + ctx.ui.theme.fg(route.auth_type === "oauth" ? "success" : "warning", route.auth_type === "oauth" ? "sub" : "api");
+    msg += " " + ctx.ui.theme.fg(route.auth_type === "oauth" ? "accent" : "warning", route.auth_type === "oauth" ? "sub" : "api");
     msg += " " + ctx.ui.theme.fg("dim", `${resolved.vendor}/${route.label}`);
     msg += " " + ctx.ui.theme.fg("dim", modelId);
     msg += " " + stateDisplay;
@@ -2089,7 +2089,7 @@ export default function (pi: ExtensionAPI): void {
     };
 
     const paintAuthType = (authType: AuthType): string => {
-      if (authType === "oauth") return paint("success", "oauth");
+      if (authType === "oauth") return paint("accent", "oauth");
       return paint("warning", "api_key");
     };
 
