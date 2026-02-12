@@ -12,7 +12,7 @@ After install, restart `pi` (or run `/reload`) and the extensions in this repo w
 
 ## Extensions
 
-- `subscription-fallback` (`/subswitch`): automatically switches between a ChatGPT subscription provider and an API-key provider when you hit usage/rate limits.
+- `subscription-fallback` (`/subswitch`): multi-vendor (OpenAI/Claude) route failover manager with preference stack, runtime setup wizard, and return-to-preferred probing.
 - `title-status`: shows a small status icon (busy/ready/pending) in the terminal title.
 - `live-commentary`: summarizes long-running bash tool output with a small widget (auto-starts after ~10s).
 - `session-context` (`/session-context`): generates a dedicated session summary line below the editor and a detailed modal on demand.

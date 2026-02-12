@@ -4,51 +4,107 @@
 
 It supports:
 
-- multiple vendors (v1: `openai`, `claude`)
+- multiple vendors (currently `openai`, `claude`)
 - multiple auth routes per vendor (`oauth`, `api_key`)
-- global failover preference stack (route + optional model override)
+- global preference-stack failover (`route_id` + optional model override)
 - configurable failover triggers (`rate_limit`, `quota_exhausted`, `auth_error`)
-- automatic return to higher-preference routes after cooldown
-- an LLM-callable bridge tool: `subswitch_manage`
+- automatic return to preferred routes after cooldown/holdoff
+- pre-return route probing (stay on fallback if probe fails)
+- persisted runtime state (cooldowns + return holdoff)
+- LLM-callable bridge tool: `subswitch_manage`
 
-## Install
+## Install / update
 
-Option A (recommended): install as a pi package:
+### Recommended: pi package install
 
 ```bash
 pi install git:github.com/continua-ai/pi-lab
 ```
 
-Option B: copy the extension into your global pi extensions dir:
+Then restart pi or run:
+
+```text
+/reload
+```
+
+`/reload` reloads extension code/resources.
+
+### Alternative: manual global extension copy
 
 ```bash
 mkdir -p ~/.pi/agent/extensions/subscription-fallback
-cp -r extensions/subscription-fallback/index.ts ~/.pi/agent/extensions/subscription-fallback/index.ts
+cp extensions/subscription-fallback/index.ts ~/.pi/agent/extensions/subscription-fallback/index.ts
 ```
 
-## Config paths
+Then run `/reload`.
 
-Config is loaded and merged in this order:
+## Quick setup (recommended)
+
+1. Run `/subswitch setup`.
+2. Choose config destination (global/project).
+3. Configure vendors/routes/order/policy/preference stack.
+4. Finish setup (writes config atomically at end).
+5. Run `/subswitch login` and complete OAuth login(s) via `/login`.
+6. Ensure API-key env vars are set for `api_key` routes.
+7. Verify:
+   - `/subswitch login-status`
+   - `/subswitch status`
+   - `/subswitch longstatus`
+
+## How failover works
+
+When a turn ends with an error, subswitch evaluates configured triggers:
+
+- `rate_limit`
+- `quota_exhausted`
+- `auth_error` (API-key routes only)
+
+If triggered:
+
+1. It places the current route on cooldown.
+   - Uses provider retry hints when available.
+   - Otherwise uses configured cooldown minutes for route/vendor.
+2. It selects the next eligible lower-priority entry in `preference_stack`.
+3. It switches to that route/model.
+4. If moving from OAuth -> API-key and vendor `auto_retry=true`, it can resend the previous user prompt.
+
+### Return-to-preferred behavior
+
+If `failover.return_to_preferred.enabled=true`, subswitch can move back up the stack after `min_stable_minutes` holdoff.
+
+Before switching upward, it performs a lightweight probe on the candidate route/model.
+
+- Probe success: switch back to preferred route.
+- Probe failure: stay on current route, set a short cooldown on the preferred candidate, retry later.
+
+User-facing notifications explicitly call this out (health check, stay-on-fallback, retry window).
+
+## Config + state paths
+
+### Config merge order
 
 1. Global: `~/.pi/agent/subswitch.json`
 2. Project: `./.pi/subswitch.json`
 
-Project entries override global top-level keys; vendor entries are merged by vendor name.
+Project values override top-level global keys. Vendor lists are merged by vendor name.
 
-Backward compatibility:
+If no `subswitch.json` exists, subswitch attempts runtime migration from legacy `subscription-fallback.json` shape.
 
-- If no `subswitch.json` exists, the extension will attempt to migrate legacy
-  `subscription-fallback.json` shape (OpenAI-only) at runtime.
+### Runtime state files
+
+State includes route cooldowns + return holdoff:
+
+- Global: `~/.pi/agent/subswitch-state.json`
+- Project: `./.pi/subswitch-state.json`
+
+State is keyed by route `id` and survives `/reload` and session restarts.
+
+### Reload commands
+
+- `/subswitch reload` -> reloads config + runtime state from disk.
+- `/reload` -> reloads extension code/resources (full extension runtime reload).
 
 ## Config schema (v2)
-
-Key ideas:
-
-- `vendors[].routes[]` defines available routes/accounts.
-- `preference_stack[]` defines failover priority globally.
-- each stack entry can optionally pin a `model`; otherwise it follows the current model.
-- `failover.scope` controls whether failover can cross vendors.
-- triggers default to `true` when omitted.
 
 ```json
 {
@@ -120,59 +176,43 @@ All control is via `/subswitch`.
 
 - `/subswitch`
   - Quick picker + status.
-
 - `/subswitch status`
-  - Show concise status.
-
+  - Concise status (stack-first).
 - `/subswitch longstatus`
-  - Show detailed status (preference stack, model overrides, route ids).
-
+  - Detailed status (stack/models/ids/providers).
 - `/subswitch setup`
-  - Guided setup wizard (supports Back via `← Back` and `/back` on inputs, includes route order, failover policy/triggers, preference stack, and OAuth login checklist). Changes apply only when setup is finished.
-
+  - Guided setup wizard (Back supported, apply-on-finish).
 - `/subswitch login`
-  - Show OAuth login checklist and optionally prefill `/login`.
-
+  - OAuth login checklist + optional `/login` prefill.
 - `/subswitch login-status`
-  - Re-check which OAuth providers still need login and update reminder widget.
-
+  - Re-check OAuth completion + update reminder widget.
 - `/subswitch reload`
-  - Reload config from disk.
-
+  - Reload config + runtime state.
 - `/subswitch on` / `/subswitch off`
-  - Enable/disable extension in the current session.
-
+  - Runtime enable/disable (current session only).
 - `/subswitch use <vendor> <auth_type> <label> [modelId]`
   - Force a specific route.
-
 - `/subswitch subscription <vendor> [label] [modelId]`
-  - Use oauth route (first eligible route if no label).
-
+  - Use OAuth route (first eligible if no label).
 - `/subswitch api <vendor> [label] [modelId]`
-  - Use api-key route (first eligible route if no label).
-
+  - Use API-key route (first eligible if no label).
 - `/subswitch rename <vendor> <auth_type> <old_label> <new_label>`
-  - Rename a route label and persist config.
-
+  - Rename route label and persist config.
 - `/subswitch reorder [vendor]`
-  - Interactive failover preference-stack reorder (optionally filtered by vendor); persists config.
-
+  - Interactive preference-stack reorder, persists config.
 - `/subswitch edit`
   - Edit JSON config with validation.
-
 - `/subswitch models <vendor>`
-  - Show model ids available across all routes for the vendor.
+  - Show compatible models across routes for vendor.
 
 Compatibility aliases:
 
 - `/subswitch primary ...` -> `subscription` (deprecated)
 - `/subswitch fallback ...` -> `api` (deprecated)
 
-## LLM-callable tool bridge
+## LLM tool bridge
 
-The extension registers a tool:
-
-- `subswitch_manage`
+Registered tool: `subswitch_manage`
 
 Supported actions:
 
@@ -180,31 +220,27 @@ Supported actions:
 - `longstatus`
 - `reload`
 - `use`
-- `prefer` (move matching route entry to the top of failover preference stack, then optionally switch)
+- `prefer`
 - `rename`
 
-This allows natural-language requests like:
-
-- “Make work the primary for gpt-5.2”
-
-…to be executed by the agent via tool calls.
+This allows natural language control via tool calls.
 
 ## Provider aliases
 
-Some ids are built-in (`openai`, `openai-codex`, `anthropic`), but the extension can register aliases such as:
+Built-ins include `openai`, `openai-codex`, and `anthropic`.
+Subswitch can register aliases such as:
 
-- `openai-codex-work` (OpenAI OAuth alias)
-- `my-codex-work` (OpenAI OAuth alias with a custom id)
-- `anthropic-work` (Claude OAuth alias)
-- `anthropic-api` (Claude API-key alias)
+- `openai-codex-work`
+- `my-codex-work`
+- `anthropic-work`
+- `anthropic-api`
 
-Alias ids are meaningful: OAuth credentials are stored per provider id in `~/.pi/agent/auth.json`.
-Use stable ids; changing ids usually requires re-login for that route.
+OAuth credentials are stored per provider id in `~/.pi/agent/auth.json`.
+Keep provider ids stable to avoid unnecessary re-login.
 
 ## Notes
 
-- If a `preference_stack` entry has no `model`, subswitch follows the current `/model` selection for that entry.
-- If a `preference_stack` entry has a `model`, that model is used when that entry is selected.
-- `failover.scope=current_vendor` restricts failover/return to entries in the current vendor.
-- `auth_error` trigger is applied only to `api_key` routes.
-- Failover detection ignores context-window errors.
+- If a stack entry omits `model`, it follows current `/model`.
+- `failover.scope=current_vendor` restricts failover/return to current vendor.
+- Context-window errors are ignored for failover triggering.
+- In interactive UI, `ready` state is colorized (theme `success`) in status displays and footer status text.

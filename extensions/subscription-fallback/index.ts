@@ -191,6 +191,18 @@ interface OriginalEnv {
   anthropic_api_key?: string;
 }
 
+interface PersistedState {
+  version?: number;
+  route_cooldown_until?: Record<string, number>;
+  next_return_eligible_at_ms?: number;
+}
+
+interface RouteProbeResult {
+  ok: boolean;
+  message?: string;
+  retry_after_ms?: number;
+}
+
 const decode = (s: string): string => {
   try {
     return decodeURIComponent(s);
@@ -249,6 +261,33 @@ function globalConfigPath(): string {
 
 function projectConfigPath(cwd: string): string {
   return join(cwd, ".pi", "subswitch.json");
+}
+
+function globalStatePath(): string {
+  return join(homedir(), ".pi", "agent", "subswitch-state.json");
+}
+
+function projectStatePath(cwd: string): string {
+  return join(cwd, ".pi", "subswitch-state.json");
+}
+
+function statePathForConfigPath(cwd: string, configPath: string): string {
+  return configPath === projectConfigPath(cwd)
+    ? projectStatePath(cwd)
+    : globalStatePath();
+}
+
+function preferredWritableStatePath(cwd: string): string {
+  return statePathForConfigPath(cwd, preferredWritableConfigPath(cwd));
+}
+
+function statePathCandidates(cwd: string): string[] {
+  const preferred = preferredWritableStatePath(cwd);
+  const fallback =
+    preferred === projectStatePath(cwd)
+      ? globalStatePath()
+      : projectStatePath(cwd);
+  return preferred === fallback ? [preferred] : [preferred, fallback];
 }
 
 function legacyGlobalConfigPath(): string {
@@ -921,8 +960,11 @@ export default function (pi: ExtensionAPI): void {
   let activeVendor: string | undefined;
   const activeRouteIndexByVendor = new Map<string, number>();
 
-  // Per-route cooldown state. Key: `${vendor}::${index}` => epoch ms
+  // Per-route cooldown state. Key: route_id => epoch ms.
   const routeCooldownUntil = new Map<string, number>();
+
+  // Persistent runtime state path (project or global, based on active config location).
+  let statePath: string | undefined;
 
   // Retry timer for cooldown expiry checks
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -941,9 +983,9 @@ export default function (pi: ExtensionAPI): void {
   // Prevent immediate bounce-backs after failover.
   let nextReturnEligibleAtMs = 0;
 
-  function routeKey(vendor: string, index: number): string {
-    return `${vendor}::${index}`;
-  }
+  const RETURN_PROBE_TIMEOUT_MS = 12_000;
+  const RETURN_PROBE_MIN_COOLDOWN_MS = 2 * 60_000;
+  const RETURN_PROBE_MAX_COOLDOWN_MS = 10 * 60_000;
 
   function now(): number {
     return Date.now();
@@ -953,6 +995,8 @@ export default function (pi: ExtensionAPI): void {
     if (!cfg) {
       cfg = loadConfig(ctx.cwd);
       registerAliasesFromConfig(cfg);
+      statePath = preferredWritableStatePath(ctx.cwd);
+      pruneRuntimeState();
     }
     return cfg;
   }
@@ -960,6 +1004,8 @@ export default function (pi: ExtensionAPI): void {
   function reloadCfg(ctx: any): void {
     cfg = loadConfig(ctx.cwd);
     registerAliasesFromConfig(cfg);
+    statePath = preferredWritableStatePath(ctx.cwd);
+    pruneRuntimeState();
   }
 
   function getVendor(vendor: string): NormalizedVendor | undefined {
@@ -988,6 +1034,106 @@ export default function (pi: ExtensionAPI): void {
       }
     }
     return undefined;
+  }
+
+  function routeStateKey(vendor: string, index: number): string | undefined {
+    const route = getRoute(vendor, index);
+    return route?.id;
+  }
+
+  function pruneRuntimeState(): void {
+    const currentTs = now();
+
+    const validRouteIds = new Set<string>();
+    if (cfg) {
+      for (const v of cfg.vendors) {
+        for (const route of v.routes) validRouteIds.add(route.id);
+      }
+    }
+
+    for (const [routeId, until] of routeCooldownUntil.entries()) {
+      if (!Number.isFinite(until) || until <= currentTs) {
+        routeCooldownUntil.delete(routeId);
+        continue;
+      }
+
+      if (validRouteIds.size > 0 && !validRouteIds.has(routeId)) {
+        routeCooldownUntil.delete(routeId);
+      }
+    }
+
+    if (!cfg?.failover.return_to_preferred.enabled || nextReturnEligibleAtMs <= currentTs) {
+      nextReturnEligibleAtMs = 0;
+    }
+  }
+
+  function buildPersistedState(): PersistedState {
+    pruneRuntimeState();
+
+    const routeCooldowns: Record<string, number> = {};
+    for (const [routeId, until] of routeCooldownUntil.entries()) {
+      routeCooldowns[routeId] = Math.floor(until);
+    }
+
+    const state: PersistedState = { version: 1 };
+    if (Object.keys(routeCooldowns).length > 0) {
+      state.route_cooldown_until = routeCooldowns;
+    }
+
+    if (nextReturnEligibleAtMs > now()) {
+      state.next_return_eligible_at_ms = Math.floor(nextReturnEligibleAtMs);
+    }
+
+    return state;
+  }
+
+  function persistRuntimeState(): void {
+    if (!statePath) return;
+    writeJson(statePath, buildPersistedState());
+  }
+
+  function loadRuntimeState(ctx: any): void {
+    ensureCfg(ctx);
+    statePath = preferredWritableStatePath(ctx.cwd);
+
+    routeCooldownUntil.clear();
+    nextReturnEligibleAtMs = 0;
+
+    const candidates = statePathCandidates(ctx.cwd);
+    for (const candidate of candidates) {
+      const raw = readJson(candidate) as PersistedState | undefined;
+      if (!raw) continue;
+
+      const routeCooldowns = raw.route_cooldown_until;
+      if (routeCooldowns && typeof routeCooldowns === "object") {
+        for (const [routeId, untilRaw] of Object.entries(routeCooldowns)) {
+          if (!routeId) continue;
+          const until = Number(untilRaw);
+          if (!Number.isFinite(until) || until <= now()) continue;
+          routeCooldownUntil.set(routeId, Math.floor(until));
+        }
+      }
+
+      const holdoff = Number(raw.next_return_eligible_at_ms);
+      if (Number.isFinite(holdoff) && holdoff > now()) {
+        nextReturnEligibleAtMs = Math.floor(holdoff);
+      }
+
+      break;
+    }
+
+    pruneRuntimeState();
+    persistRuntimeState();
+  }
+
+  function setNextReturnEligibleAtMs(untilMs: number): void {
+    const normalized = Number.isFinite(untilMs)
+      ? Math.max(0, Math.floor(untilMs))
+      : 0;
+
+    if (normalized === nextReturnEligibleAtMs) return;
+    nextReturnEligibleAtMs = normalized;
+    persistRuntimeState();
   }
 
   function captureOriginalEnv(): void {
@@ -1078,11 +1224,32 @@ export default function (pi: ExtensionAPI): void {
   }
 
   function getRouteCooldownUntil(vendor: string, index: number): number {
-    return routeCooldownUntil.get(routeKey(vendor, index)) ?? 0;
+    const key = routeStateKey(vendor, index);
+    if (!key) return 0;
+    return routeCooldownUntil.get(key) ?? 0;
   }
 
   function setRouteCooldownUntil(vendor: string, index: number, untilMs: number): void {
-    routeCooldownUntil.set(routeKey(vendor, index), Math.max(untilMs, 0));
+    const key = routeStateKey(vendor, index);
+    if (!key) return;
+
+    const normalized = Number.isFinite(untilMs)
+      ? Math.max(0, Math.floor(untilMs))
+      : 0;
+    const previous = routeCooldownUntil.get(key) ?? 0;
+
+    if (normalized <= now()) {
+      if (previous !== 0) {
+        routeCooldownUntil.delete(key);
+        persistRuntimeState();
+      }
+      return;
+    }
+
+    if (previous === normalized) return;
+
+    routeCooldownUntil.set(key, normalized);
+    persistRuntimeState();
   }
 
   function isRouteCoolingDown(vendor: string, index: number): boolean {
@@ -1200,6 +1367,270 @@ export default function (pi: ExtensionAPI): void {
     return next;
   }
 
+  function extractCodexAccountId(token: string): string | undefined {
+    try {
+      const parts = token.split(".");
+      if (parts.length !== 3) return undefined;
+
+      const normalized = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+      const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+
+      const payload = JSON.parse(Buffer.from(padded, "base64").toString("utf-8"));
+      const claim = payload?.["https://api.openai.com/auth"];
+      const accountId = claim?.chatgpt_account_id;
+      return accountId ? String(accountId) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function resolveCodexProbeUrl(baseUrl: string): string {
+    const raw = String(baseUrl ?? "").trim() || "https://chatgpt.com/backend-api";
+    const normalized = raw.replace(/\/+$/, "");
+    if (normalized.endsWith("/codex/responses")) return normalized;
+    if (normalized.endsWith("/codex")) return `${normalized}/responses`;
+    return `${normalized}/codex/responses`;
+  }
+
+  function trimProbeMessage(message: string): string {
+    const oneLine = String(message ?? "").replace(/\s+/g, " ").trim();
+    if (!oneLine) return "unknown probe error";
+    if (oneLine.length <= 180) return oneLine;
+    return `${oneLine.slice(0, 177)}...`;
+  }
+
+  function applyOpenAIRouteHeaders(route: NormalizedRoute, headers: Headers): void {
+    if (route.openai_org_id_env) {
+      const org = process.env[route.openai_org_id_env];
+      if (org && org.trim()) headers.set("OpenAI-Organization", org.trim());
+    }
+
+    if (route.openai_project_id_env) {
+      const project = process.env[route.openai_project_id_env];
+      if (project && project.trim()) headers.set("OpenAI-Project", project.trim());
+    }
+  }
+
+  async function parseProbeFailureResponse(response: Response): Promise<string> {
+    const rawText = (await response.text()).trim();
+    if (!rawText) return `HTTP ${response.status}`;
+
+    try {
+      const parsed = JSON.parse(rawText);
+      const msg =
+        parsed?.error?.message ??
+        parsed?.error?.details ??
+        parsed?.message ??
+        parsed?.detail ??
+        rawText;
+      return trimProbeMessage(`HTTP ${response.status}: ${String(msg)}`);
+    } catch {
+      return trimProbeMessage(`HTTP ${response.status}: ${rawText}`);
+    }
+  }
+
+  async function runRouteProbeRequest(
+    model: any,
+    route: NormalizedRoute,
+    apiKey: string,
+    signal: AbortSignal,
+  ): Promise<Response> {
+    const api = String(model?.api ?? "").trim();
+    const baseUrl = String(model?.baseUrl ?? "").trim().replace(/\/+$/, "");
+
+    if (api === "openai-codex-responses") {
+      const headers = new Headers(model?.headers ?? {});
+      headers.set("Authorization", `Bearer ${apiKey}`);
+      headers.set("OpenAI-Beta", "responses=experimental");
+      headers.set("originator", "pi");
+      headers.set("User-Agent", "pi-subswitch-probe");
+      headers.set("accept", "application/json");
+      headers.set("content-type", "application/json");
+
+      const accountId = extractCodexAccountId(apiKey);
+      if (accountId) headers.set("chatgpt-account-id", accountId);
+
+      const body = {
+        model: model.id,
+        store: false,
+        stream: false,
+        input: [{ role: "user", content: [{ type: "input_text", text: "health check" }] }],
+        text: { verbosity: "low" },
+      };
+
+      return fetch(resolveCodexProbeUrl(baseUrl), {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal,
+      });
+    }
+
+    if (api === "openai-responses" || api === "openai-completions") {
+      const headers = new Headers(model?.headers ?? {});
+      headers.set("Authorization", `Bearer ${apiKey}`);
+      headers.set("accept", "application/json");
+      headers.set("content-type", "application/json");
+      applyOpenAIRouteHeaders(route, headers);
+
+      if (api === "openai-responses") {
+        const body = {
+          model: model.id,
+          input: "health check",
+          max_output_tokens: 1,
+          store: false,
+        };
+        return fetch(`${baseUrl}/responses`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+          signal,
+        });
+      }
+
+      const body = {
+        model: model.id,
+        messages: [{ role: "user", content: "health check" }],
+        max_tokens: 1,
+        temperature: 0,
+      };
+      return fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal,
+      });
+    }
+
+    if (api === "anthropic-messages") {
+      const headers = new Headers(model?.headers ?? {});
+      const isOauth = apiKey.includes("sk-ant-oat");
+
+      headers.set("accept", "application/json");
+      headers.set("content-type", "application/json");
+      headers.set("anthropic-version", "2023-06-01");
+      headers.set("anthropic-dangerous-direct-browser-access", "true");
+
+      if (isOauth) {
+        headers.set("Authorization", `Bearer ${apiKey}`);
+        headers.set(
+          "anthropic-beta",
+          "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
+        );
+        headers.set("user-agent", "claude-cli/2.1.2 (external, cli)");
+        headers.set("x-app", "cli");
+      } else {
+        headers.set("x-api-key", apiKey);
+        headers.set(
+          "anthropic-beta",
+          "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
+        );
+      }
+
+      const body: any = {
+        model: model.id,
+        max_tokens: 1,
+        stream: false,
+        messages: [{ role: "user", content: "health check" }],
+      };
+
+      if (isOauth) {
+        body.system = [
+          {
+            type: "text",
+            text: "You are Claude Code, Anthropic's official CLI for Claude.",
+          },
+        ];
+      }
+
+      const url = baseUrl.endsWith("/v1") ? `${baseUrl}/messages` : `${baseUrl}/v1/messages`;
+      return fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal,
+      });
+    }
+
+    throw new Error(`unsupported probe api '${api || "unknown"}'`);
+  }
+
+  async function probeRouteModel(
+    ctx: any,
+    ref: ResolvedRouteRef,
+    modelId: string,
+  ): Promise<RouteProbeResult> {
+    const route = ref.route;
+    const model = ctx.modelRegistry.find(route.provider_id, modelId);
+    if (!model) {
+      return {
+        ok: false,
+        message: `model unavailable for probe (${route.provider_id}/${modelId})`,
+      };
+    }
+
+    let apiKey: string | undefined;
+    if (route.auth_type === "api_key") {
+      apiKey = resolveApiKey(route);
+    } else {
+      try {
+        const key = await ctx.modelRegistry.getApiKey(model);
+        apiKey = key ? String(key).trim() : undefined;
+      } catch {
+        apiKey = undefined;
+      }
+    }
+
+    if (!apiKey) {
+      return { ok: false, message: "missing credentials for probe" };
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), RETURN_PROBE_TIMEOUT_MS);
+
+    try {
+      const response = await runRouteProbeRequest(model, route, apiKey, controller.signal);
+      if (response.ok) return { ok: true };
+
+      const message = await parseProbeFailureResponse(response);
+      return {
+        ok: false,
+        message,
+        retry_after_ms: parseRetryAfterMs(message),
+      };
+    } catch (error) {
+      const message = trimProbeMessage(
+        error instanceof Error ? error.message : String(error),
+      );
+      return {
+        ok: false,
+        message,
+        retry_after_ms: parseRetryAfterMs(message),
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  function probeFailureCooldownMs(
+    vendorCfg: NormalizedVendor,
+    route: NormalizedRoute,
+    probe: RouteProbeResult,
+  ): number {
+    if (probe.retry_after_ms !== undefined && probe.retry_after_ms > 0) {
+      return Math.max(
+        RETURN_PROBE_MIN_COOLDOWN_MS,
+        Math.min(probe.retry_after_ms + 5_000, RETURN_PROBE_MAX_COOLDOWN_MS),
+      );
+    }
+
+    const configuredMs = routeDefaultCooldownMinutes(vendorCfg, route) * 60_000;
+    return Math.max(
+      RETURN_PROBE_MIN_COOLDOWN_MS,
+      Math.min(configuredMs, RETURN_PROBE_MAX_COOLDOWN_MS),
+    );
+  }
+
   async function maybePromotePreferredRoute(ctx: any, reason: string): Promise<void> {
     if (!cfg?.enabled) return;
     if (!cfg.failover.return_to_preferred.enabled) return;
@@ -1223,14 +1654,48 @@ export default function (pi: ExtensionAPI): void {
     if (currentIdx !== undefined && bestIdx >= currentIdx) return;
 
     const target = effective[bestIdx];
+    const targetVendorCfg = getVendor(target.route_ref.vendor);
+    if (!targetVendorCfg) return;
+
     if (ctx.hasUI) {
       ctx.ui.notify(
-        `[${EXT}] Recovering preferred route: ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})`,
+        `[${EXT}] Checking preferred route health: ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})`,
         "info",
       );
     }
 
-    await switchToRoute(
+    const probe = await probeRouteModel(ctx, target.route_ref, target.model_id);
+    if (!probe.ok) {
+      const cooldownMs = probeFailureCooldownMs(
+        targetVendorCfg,
+        target.route_ref.route,
+        probe,
+      );
+      const cooldownUntil = now() + cooldownMs;
+      setRouteCooldownUntil(target.route_ref.vendor, target.route_ref.index, cooldownUntil);
+
+      if (ctx.hasUI) {
+        const mins = Math.max(0, Math.ceil(cooldownMs / 60000));
+        const reasonText = probe.message ? ` Probe error: ${probe.message}` : "";
+        ctx.ui.notify(
+          `[${EXT}] Preferred route still unavailable. Staying on ${routeDisplay(resolved.vendor, currentRoute)} (${currentModelId}). Retry in ~${mins}m.${reasonText}`,
+          "warning",
+        );
+      }
+
+      scheduleRetryTimer(ctx);
+      updateStatus(ctx);
+      return;
+    }
+
+    if (ctx.hasUI) {
+      ctx.ui.notify(
+        `[${EXT}] Preferred route is healthy again; switching to ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})`,
+        "info",
+      );
+    }
+
+    const switched = await switchToRoute(
       ctx,
       target.route_ref.vendor,
       target.route_ref.index,
@@ -1238,6 +1703,13 @@ export default function (pi: ExtensionAPI): void {
       reason,
       true,
     );
+
+    if (!switched && ctx.hasUI) {
+      ctx.ui.notify(
+        `[${EXT}] Preferred route probe passed, but model switch failed. Staying on ${routeDisplay(resolved.vendor, currentRoute)} (${currentModelId}).`,
+        "warning",
+      );
+    }
   }
 
   function scheduleRetryTimer(ctx: any): void {
@@ -1490,10 +1962,26 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
+    let state = "ready";
+    if (isRouteCoolingDown(resolved.vendor, resolved.index)) {
+      const mins = Math.max(
+        0,
+        Math.ceil((getRouteCooldownUntil(resolved.vendor, resolved.index) - now()) / 60000),
+      );
+      state = `cooldown~${mins}m`;
+    } else if (!routeCanHandleModel(ctx, route, modelId)) {
+      state = "model_unavailable";
+    } else if (!routeHasUsableCredentials(resolved.vendor, route)) {
+      state = "missing_credentials";
+    }
+
+    const stateDisplay = state === "ready" ? ctx.ui.theme.fg("success", state) : state;
+
     let msg = ctx.ui.theme.fg("muted", `${EXT}:`);
     msg += " " + ctx.ui.theme.fg("accent", route.auth_type === "oauth" ? "sub" : "api");
     msg += " " + ctx.ui.theme.fg("dim", `${resolved.vendor}/${route.label}`);
     msg += " " + ctx.ui.theme.fg("dim", modelId);
+    msg += " " + stateDisplay;
 
     const hint = nearestPreferredCooldownHint(resolved.vendor, route.id, modelId);
     if (hint) msg += " " + ctx.ui.theme.fg("dim", `(${hint})`);
@@ -1501,10 +1989,17 @@ export default function (pi: ExtensionAPI): void {
     ctx.ui.setStatus(EXT, msg);
   }
 
-  function buildStatusLines(ctx: any, detailed = false): string[] {
+  function buildStatusLines(ctx: any, detailed = false, colorizeReady = false): string[] {
     if (!cfg) return ["(no config loaded)"];
 
     const lines: string[] = [];
+
+    const displayState = (state: string): string => {
+      if (state === "ready" && colorizeReady && ctx.hasUI) {
+        return ctx.ui.theme.fg("success", state);
+      }
+      return state;
+    };
 
     const currentProvider = ctx.model?.provider;
     const currentModel = ctx.model?.id;
@@ -1561,14 +2056,15 @@ export default function (pi: ExtensionAPI): void {
       }
 
       const activeMark = isActive ? "*" : " ";
+      const stateDisplay = displayState(state);
       if (detailed) {
         const modelOverridePart = entry.model ? `, model_override=${entry.model}` : "";
         lines.push(
-          `  ${activeMark} ${i + 1}. ${routeDisplay(ref.vendor, ref.route)} (id=${ref.route.id}, provider=${ref.route.provider_id}${modelOverridePart}, ${state})`,
+          `  ${activeMark} ${i + 1}. ${routeDisplay(ref.vendor, ref.route)} (id=${ref.route.id}, provider=${ref.route.provider_id}${modelOverridePart}, ${stateDisplay})`,
         );
       } else {
         lines.push(
-          `  ${activeMark} ${i + 1}. ${routeDisplay(ref.vendor, ref.route)} (${state})`,
+          `  ${activeMark} ${i + 1}. ${routeDisplay(ref.vendor, ref.route)} (${stateDisplay})`,
         );
       }
     }
@@ -1583,7 +2079,7 @@ export default function (pi: ExtensionAPI): void {
             ? `cooldown~${Math.max(0, Math.ceil((getRouteCooldownUntil(v.vendor, i) - now()) / 60000))}m`
             : "ready";
           lines.push(
-            `  ${active} ${i + 1}. ${route.auth_type} ${decode(route.label)} (id=${route.id}, provider=${route.provider_id}, ${cooling})`,
+            `  ${active} ${i + 1}. ${route.auth_type} ${decode(route.label)} (id=${route.id}, provider=${route.provider_id}, ${displayState(cooling)})`,
           );
         }
       }
@@ -1594,7 +2090,7 @@ export default function (pi: ExtensionAPI): void {
 
   function notifyStatus(ctx: any, detailed = false): void {
     if (!ctx.hasUI) return;
-    ctx.ui.notify(buildStatusLines(ctx, detailed).join("\n"), "info");
+    ctx.ui.notify(buildStatusLines(ctx, detailed, true).join("\n"), "info");
   }
 
   function configuredOauthProviders(): string[] {
@@ -1924,7 +2420,11 @@ export default function (pi: ExtensionAPI): void {
   function saveCurrentConfig(ctx: any): string {
     const path = preferredWritableConfigPath(ctx.cwd);
     if (!cfg) return path;
+
     writeJson(path, configToJson(cfg));
+    statePath = statePathForConfigPath(ctx.cwd, path);
+    pruneRuntimeState();
+    persistRuntimeState();
     return path;
   }
 
@@ -2808,6 +3308,9 @@ export default function (pi: ExtensionAPI): void {
 
       cfg = out;
       registerAliasesFromConfig(cfg);
+      statePath = statePathForConfigPath(ctx.cwd, targetPath);
+      pruneRuntimeState();
+      persistRuntimeState();
 
       ctx.ui.notify(`[${EXT}] Wrote config to ${targetPath}`, "info");
 
@@ -2880,6 +3383,7 @@ export default function (pi: ExtensionAPI): void {
 
     if (selected === "Reload config") {
       reloadCfg(ctx);
+      loadRuntimeState(ctx);
       notifyStatus(ctx);
       updateStatus(ctx);
       return;
@@ -2977,8 +3481,9 @@ export default function (pi: ExtensionAPI): void {
 
       if (action === "reload") {
         reloadCfg(ctx);
+        loadRuntimeState(ctx);
         updateStatus(ctx);
-        const text = `Reloaded config.\n${toolStatusSummary(ctx, false)}`;
+        const text = `Reloaded config and runtime state.\n${toolStatusSummary(ctx, false)}`;
         return {
           content: [{ type: "text", text }],
           details: { action, ok: true },
@@ -3139,7 +3644,7 @@ export default function (pi: ExtensionAPI): void {
             "  setup                         Guided setup wizard (applies only on finish)\n" +
             "  login                         Prompt OAuth login checklist and prefill /login\n" +
             "  login-status                  Re-check OAuth login completion and update reminder\n" +
-            "  reload                        Reload config\n" +
+            "  reload                        Reload config + runtime state\n" +
             "  on / off                      Enable/disable extension (runtime)\n" +
             "  reorder [vendor]              Interactive reorder for failover preference stack\n" +
             "  edit                          Edit JSON config with validation\n" +
@@ -3188,6 +3693,7 @@ export default function (pi: ExtensionAPI): void {
 
       if (cmd === "reload") {
         reloadCfg(ctx);
+        loadRuntimeState(ctx);
         notifyStatus(ctx);
         updateStatus(ctx);
         return;
@@ -3205,7 +3711,6 @@ export default function (pi: ExtensionAPI): void {
         clearRetryTimer();
         restoreOriginalEnv();
         pendingOauthReminderProviders = [];
-        nextReturnEligibleAtMs = 0;
         if (ctx.hasUI) {
           ctx.ui.notify(`[${EXT}] enabled=false (runtime)`, "warning");
           ctx.ui.setStatus(EXT, undefined);
@@ -3485,7 +3990,7 @@ export default function (pi: ExtensionAPI): void {
 
     if (cfg.failover.return_to_preferred.enabled) {
       const holdoffMs = cfg.failover.return_to_preferred.min_stable_minutes * 60_000;
-      nextReturnEligibleAtMs = Math.max(nextReturnEligibleAtMs, now() + holdoffMs);
+      setNextReturnEligibleAtMs(Math.max(nextReturnEligibleAtMs, now() + holdoffMs));
     }
 
     // Auto-retry only when moving from OAuth to API key route and vendor policy allows it.
@@ -3514,10 +4019,10 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     reloadCfg(ctx);
+    loadRuntimeState(ctx);
     lastCtx = ctx;
     rememberActiveFromCtx(ctx);
     managedModelId = ctx.model?.id;
-    nextReturnEligibleAtMs = 0;
 
     // If we start on an api_key route we might need to apply env material now.
     const provider = ctx.model?.provider;
@@ -3538,18 +4043,18 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_switch", async (_event, ctx) => {
     reloadCfg(ctx);
+    loadRuntimeState(ctx);
     lastCtx = ctx;
     rememberActiveFromCtx(ctx);
     managedModelId = ctx.model?.id;
-    nextReturnEligibleAtMs = 0;
     scheduleRetryTimer(ctx);
     await refreshOauthReminderWidget(ctx, configuredOauthProviders());
     updateStatus(ctx);
   });
 
   pi.on("session_shutdown", async () => {
+    persistRuntimeState();
     clearRetryTimer();
-    nextReturnEligibleAtMs = 0;
     restoreOriginalEnv();
   });
 }
