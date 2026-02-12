@@ -983,6 +983,9 @@ export default function (pi: ExtensionAPI): void {
   // Prevent immediate bounce-backs after failover.
   let nextReturnEligibleAtMs = 0;
 
+  // Ensure we do not run concurrent preferred-route probes.
+  let promotionProbeInFlight = false;
+
   const RETURN_PROBE_TIMEOUT_MS = 12_000;
   const RETURN_PROBE_MIN_COOLDOWN_MS = 2 * 60_000;
   const RETURN_PROBE_MAX_COOLDOWN_MS = 10 * 60_000;
@@ -1719,6 +1722,7 @@ export default function (pi: ExtensionAPI): void {
     if (!cfg?.enabled) return;
     if (!cfg.failover.return_to_preferred.enabled) return;
     if (!ctx.model?.id || !ctx.model?.provider) return;
+    if (typeof ctx.isIdle === "function" && !ctx.isIdle()) return;
     if (nextReturnEligibleAtMs > now()) return;
 
     const resolved = resolveVendorRouteForProvider(ctx.model.provider);
@@ -1771,6 +1775,10 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
+    if (typeof ctx.isIdle === "function" && !ctx.isIdle()) {
+      return;
+    }
+
     if (ctx.hasUI) {
       ctx.ui.notify(
         `[${EXT}] Preferred route is healthy again. Switching to ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id}).`,
@@ -1795,6 +1803,24 @@ export default function (pi: ExtensionAPI): void {
     }
   }
 
+  function requestBackgroundPreferredRouteCheck(ctx: any, reason: string): void {
+    if (!cfg?.enabled) return;
+    if (!cfg.failover.return_to_preferred.enabled) return;
+    if (promotionProbeInFlight) return;
+
+    if (typeof ctx.isIdle === "function" && !ctx.isIdle()) return;
+
+    promotionProbeInFlight = true;
+    void Promise.resolve(maybePromotePreferredRoute(ctx, reason))
+      .catch(() => {
+        // No-op: maybePromotePreferredRoute already emits user-facing diagnostics.
+      })
+      .finally(() => {
+        promotionProbeInFlight = false;
+        updateStatus(ctx);
+      });
+  }
+
   function scheduleRetryTimer(ctx: any): void {
     clearRetryTimer();
 
@@ -1802,24 +1828,12 @@ export default function (pi: ExtensionAPI): void {
     if (!next) return;
 
     const delay = Math.max(1000, next - now());
-    retryTimer = setTimeout(async () => {
+    retryTimer = setTimeout(() => {
       retryTimer = undefined;
 
-      if (!lastCtx) {
-        scheduleRetryTimer(ctx);
-        return;
-      }
-
-      if (typeof lastCtx.isIdle === "function" && !lastCtx.isIdle()) {
-        scheduleRetryTimer(lastCtx);
-        return;
-      }
-
-      try {
-        await maybePromotePreferredRoute(lastCtx, "cooldown expired");
-      } finally {
-        scheduleRetryTimer(lastCtx);
-      }
+      const activeCtx = lastCtx ?? ctx;
+      requestBackgroundPreferredRouteCheck(activeCtx, "cooldown expired");
+      scheduleRetryTimer(activeCtx);
     }, delay);
   }
 
@@ -3972,7 +3986,7 @@ export default function (pi: ExtensionAPI): void {
     };
     pendingInputSource = undefined;
 
-    await maybePromotePreferredRoute(ctx, "before turn");
+    // Keep prompt start fast: do not run preferred-route probes on the user start path.
     scheduleRetryTimer(ctx);
     updateStatus(ctx);
   });
@@ -4016,7 +4030,12 @@ export default function (pi: ExtensionAPI): void {
     rememberActiveFromCtx(ctx);
 
     const message: any = event.message;
-    if (message?.stopReason !== "error") return;
+    if (message?.stopReason !== "error") {
+      requestBackgroundPreferredRouteCheck(ctx, "after turn");
+      scheduleRetryTimer(ctx);
+      updateStatus(ctx);
+      return;
+    }
 
     const err = message?.errorMessage ?? message?.details?.error ?? message?.error ?? "unknown error";
 

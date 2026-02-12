@@ -73,6 +73,7 @@ If triggered:
 If `failover.return_to_preferred.enabled=true`, subswitch can move back up the stack after `min_stable_minutes` holdoff.
 
 Before switching upward, it performs a lightweight probe on the candidate route/model.
+The probe runs as an idle/background check and is not awaited on user prompt start.
 
 - Probe success: switch back to preferred route.
 - Probe failure: stay on current route, set a short cooldown on the preferred candidate, retry later.
