@@ -3993,14 +3993,8 @@ export default function (pi: ExtensionAPI): void {
       setNextReturnEligibleAtMs(Math.max(nextReturnEligibleAtMs, now() + holdoffMs));
     }
 
-    // Auto-retry only when moving from OAuth to API key route and vendor policy allows it.
-    if (
-      route.auth_type === "oauth" &&
-      nextEntry.route_ref.route.auth_type === "api_key" &&
-      vendorCfg.auto_retry &&
-      lastPrompt &&
-      lastPrompt.source !== "extension"
-    ) {
+    // Auto-retry after any successful automatic failover switch when enabled.
+    if (vendorCfg.auto_retry && lastPrompt && lastPrompt.source !== "extension") {
       const content =
         !lastPrompt.images || lastPrompt.images.length === 0
           ? lastPrompt.text

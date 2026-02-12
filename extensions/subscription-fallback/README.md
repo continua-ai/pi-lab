@@ -66,7 +66,7 @@ If triggered:
    - Otherwise uses configured cooldown minutes for route/vendor.
 2. It selects the next eligible lower-priority entry in `preference_stack`.
 3. It switches to that route/model.
-4. If moving from OAuth -> API-key and vendor `auto_retry=true`, it can resend the previous user prompt.
+4. After any automatic failover switch, if vendor `auto_retry=true`, it resends the previous user prompt (immediate if idle, otherwise queued as follow-up).
 
 ### Return-to-preferred behavior
 
