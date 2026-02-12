@@ -991,6 +991,90 @@ export default function (pi: ExtensionAPI): void {
     return Date.now();
   }
 
+  function formatDurationCompact(ms: number): string {
+    const safeMs = Math.max(0, Math.floor(ms));
+    const totalMinutes = Math.max(0, Math.ceil(safeMs / 60000));
+
+    if (totalMinutes < 60) {
+      return `${totalMinutes}m`;
+    }
+
+    const totalHours = Math.floor(totalMinutes / 60);
+    const remMinutes = totalMinutes % 60;
+
+    if (totalHours < 24) {
+      return remMinutes > 0 ? `${totalHours}h ${remMinutes}m` : `${totalHours}h`;
+    }
+
+    const totalDays = Math.floor(totalHours / 24);
+    const remHours = totalHours % 24;
+    return remHours > 0 ? `${totalDays}d ${remHours}h` : `${totalDays}d`;
+  }
+
+  function isSameLocalDay(a: Date, b: Date): boolean {
+    return (
+      a.getFullYear() === b.getFullYear() &&
+      a.getMonth() === b.getMonth() &&
+      a.getDate() === b.getDate()
+    );
+  }
+
+  function isTomorrowLocalDay(target: Date, relativeTo: Date): boolean {
+    const tomorrow = new Date(relativeTo.getTime());
+    tomorrow.setHours(0, 0, 0, 0);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    return isSameLocalDay(target, tomorrow);
+  }
+
+  function formatUntilLocal(untilMs: number): string {
+    const target = new Date(untilMs);
+    const current = new Date(now());
+
+    const localTime = target.toLocaleTimeString([], {
+      hour: "numeric",
+      minute: "2-digit",
+    });
+
+    if (isSameLocalDay(target, current)) {
+      return `until ${localTime} local`;
+    }
+
+    if (isTomorrowLocalDay(target, current)) {
+      return `until tomorrow ${localTime} local`;
+    }
+
+    const localDate = target.toLocaleDateString([], {
+      month: "short",
+      day: "numeric",
+      ...(target.getFullYear() !== current.getFullYear() ? { year: "numeric" as const } : {}),
+    });
+
+    return `until ${localDate} ${localTime} local`;
+  }
+
+  function formatRetryWindow(untilMs: number): string {
+    return `~${formatDurationCompact(untilMs - now())} (${formatUntilLocal(untilMs)})`;
+  }
+
+  function humanReadableRouteState(
+    rawState: string,
+    cooldownUntilMs?: number,
+  ): string {
+    if (rawState === "ready") return "ready";
+    if (rawState === "waiting_for_current_model") return "waiting for current /model";
+    if (rawState === "model_unavailable") return "model unavailable";
+    if (rawState === "missing_credentials") return "credentials needed";
+
+    if (rawState.startsWith("cooldown")) {
+      if (cooldownUntilMs && cooldownUntilMs > now()) {
+        return `cooling down: ${formatRetryWindow(cooldownUntilMs)}`;
+      }
+      return "cooling down";
+    }
+
+    return rawState;
+  }
+
   function ensureCfg(ctx: any): NormalizedConfig {
     if (!cfg) {
       cfg = loadConfig(ctx.cwd);
@@ -1659,7 +1743,7 @@ export default function (pi: ExtensionAPI): void {
 
     if (ctx.hasUI) {
       ctx.ui.notify(
-        `[${EXT}] Checking preferred route health: ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})`,
+        `[${EXT}] Checking whether preferred route is healthy: ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})…`,
         "info",
       );
     }
@@ -1675,10 +1759,9 @@ export default function (pi: ExtensionAPI): void {
       setRouteCooldownUntil(target.route_ref.vendor, target.route_ref.index, cooldownUntil);
 
       if (ctx.hasUI) {
-        const mins = Math.max(0, Math.ceil(cooldownMs / 60000));
-        const reasonText = probe.message ? ` Probe error: ${probe.message}` : "";
+        const reasonText = probe.message ? ` Reason: ${probe.message}` : "";
         ctx.ui.notify(
-          `[${EXT}] Preferred route still unavailable. Staying on ${routeDisplay(resolved.vendor, currentRoute)} (${currentModelId}). Retry in ~${mins}m.${reasonText}`,
+          `[${EXT}] Preferred route still unavailable. Staying on ${routeDisplay(resolved.vendor, currentRoute)}. Next check in ${formatRetryWindow(cooldownUntil)}.${reasonText}`,
           "warning",
         );
       }
@@ -1690,7 +1773,7 @@ export default function (pi: ExtensionAPI): void {
 
     if (ctx.hasUI) {
       ctx.ui.notify(
-        `[${EXT}] Preferred route is healthy again; switching to ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})`,
+        `[${EXT}] Preferred route is healthy again. Switching to ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id}).`,
         "info",
       );
     }
@@ -1706,7 +1789,7 @@ export default function (pi: ExtensionAPI): void {
 
     if (!switched && ctx.hasUI) {
       ctx.ui.notify(
-        `[${EXT}] Preferred route probe passed, but model switch failed. Staying on ${routeDisplay(resolved.vendor, currentRoute)} (${currentModelId}).`,
+        `[${EXT}] Preferred route looks healthy, but switching failed. Staying on ${routeDisplay(resolved.vendor, currentRoute)}.`,
         "warning",
       );
     }
@@ -1931,8 +2014,7 @@ export default function (pi: ExtensionAPI): void {
 
     if (!nearestUntil) return undefined;
 
-    const mins = Math.max(0, Math.ceil((nearestUntil - now()) / 60000));
-    return `preferred retry ~${mins}m`;
+    return `preferred retry ${formatRetryWindow(nearestUntil)}`;
   }
 
   function updateStatus(ctx: any): void {
@@ -1963,19 +2045,19 @@ export default function (pi: ExtensionAPI): void {
     }
 
     let state = "ready";
+    let cooldownUntil: number | undefined;
+
     if (isRouteCoolingDown(resolved.vendor, resolved.index)) {
-      const mins = Math.max(
-        0,
-        Math.ceil((getRouteCooldownUntil(resolved.vendor, resolved.index) - now()) / 60000),
-      );
-      state = `cooldown~${mins}m`;
+      cooldownUntil = getRouteCooldownUntil(resolved.vendor, resolved.index);
+      state = "cooldown";
     } else if (!routeCanHandleModel(ctx, route, modelId)) {
       state = "model_unavailable";
     } else if (!routeHasUsableCredentials(resolved.vendor, route)) {
       state = "missing_credentials";
     }
 
-    const stateDisplay = state === "ready" ? ctx.ui.theme.fg("success", state) : state;
+    const stateText = humanReadableRouteState(state, cooldownUntil);
+    const stateDisplay = stateText === "ready" ? ctx.ui.theme.fg("success", stateText) : stateText;
 
     let msg = ctx.ui.theme.fg("muted", `${EXT}:`);
     msg += " " + ctx.ui.theme.fg("accent", route.auth_type === "oauth" ? "sub" : "api");
@@ -1994,11 +2076,12 @@ export default function (pi: ExtensionAPI): void {
 
     const lines: string[] = [];
 
-    const displayState = (state: string): string => {
-      if (state === "ready" && colorizeReady && ctx.hasUI) {
-        return ctx.ui.theme.fg("success", state);
+    const displayState = (state: string, cooldownUntilMs?: number): string => {
+      const text = humanReadableRouteState(state, cooldownUntilMs);
+      if (text === "ready" && colorizeReady && ctx.hasUI) {
+        return ctx.ui.theme.fg("success", text);
       }
-      return state;
+      return text;
     };
 
     const currentProvider = ctx.model?.provider;
@@ -2015,8 +2098,7 @@ export default function (pi: ExtensionAPI): void {
       );
 
       if (nextReturnEligibleAtMs > now()) {
-        const mins = Math.max(0, Math.ceil((nextReturnEligibleAtMs - now()) / 60000));
-        lines.push(`return_holdoff~${mins}m`);
+        lines.push(`return holdoff: ${formatRetryWindow(nextReturnEligibleAtMs)}`);
       }
 
       if (currentProvider && currentModel) {
@@ -2041,14 +2123,12 @@ export default function (pi: ExtensionAPI): void {
         (entry.model === undefined || entry.model === currentModel);
 
       let state = "ready";
+      let cooldownUntil: number | undefined;
       if (!modelId) {
         state = "waiting_for_current_model";
       } else if (isRouteCoolingDown(ref.vendor, ref.index)) {
-        const mins = Math.max(
-          0,
-          Math.ceil((getRouteCooldownUntil(ref.vendor, ref.index) - now()) / 60000),
-        );
-        state = `cooldown~${mins}m`;
+        state = "cooldown";
+        cooldownUntil = getRouteCooldownUntil(ref.vendor, ref.index);
       } else if (!routeCanHandleModel(ctx, ref.route, modelId)) {
         state = "model_unavailable";
       } else if (!routeHasUsableCredentials(ref.vendor, ref.route)) {
@@ -2056,7 +2136,7 @@ export default function (pi: ExtensionAPI): void {
       }
 
       const activeMark = isActive ? "*" : " ";
-      const stateDisplay = displayState(state);
+      const stateDisplay = displayState(state, cooldownUntil);
       if (detailed) {
         const modelOverridePart = entry.model ? `, model_override=${entry.model}` : "";
         lines.push(
@@ -2075,11 +2155,12 @@ export default function (pi: ExtensionAPI): void {
         for (let i = 0; i < v.routes.length; i++) {
           const route = v.routes[i];
           const active = activeRouteIndexByVendor.get(v.vendor) === i ? "*" : " ";
-          const cooling = isRouteCoolingDown(v.vendor, i)
-            ? `cooldown~${Math.max(0, Math.ceil((getRouteCooldownUntil(v.vendor, i) - now()) / 60000))}m`
-            : "ready";
+          const routeState = isRouteCoolingDown(v.vendor, i) ? "cooldown" : "ready";
+          const cooldownUntil = routeState === "cooldown"
+            ? getRouteCooldownUntil(v.vendor, i)
+            : undefined;
           lines.push(
-            `  ${active} ${i + 1}. ${route.auth_type} ${decode(route.label)} (id=${route.id}, provider=${route.provider_id}, ${displayState(cooling)})`,
+            `  ${active} ${i + 1}. ${route.auth_type} ${decode(route.label)} (id=${route.id}, provider=${route.provider_id}, ${displayState(routeState, cooldownUntil)})`,
           );
         }
       }
@@ -3954,9 +4035,8 @@ export default function (pi: ExtensionAPI): void {
 
     if (!nextEntry) {
       if (ctx.hasUI) {
-        const mins = Math.max(0, Math.ceil((until - now()) / 60000));
         ctx.ui.notify(
-          `[${EXT}] ${routeDisplay(resolved.vendor, route)} ${triggerLabel}; no eligible lower-priority entry in preference stack (retry ~${mins}m)`,
+          `[${EXT}] ${routeDisplay(resolved.vendor, route)} hit ${triggerLabel}. No eligible fallback route. Next retry in ${formatRetryWindow(until)}.`,
           "warning",
         );
       }
@@ -3966,9 +4046,8 @@ export default function (pi: ExtensionAPI): void {
     }
 
     if (ctx.hasUI) {
-      const source = parsedRetryMs !== undefined ? "provider retry hint" : "configured cooldown";
       ctx.ui.notify(
-        `[${EXT}] ${routeDisplay(resolved.vendor, route)} ${triggerLabel}; switching to ${routeDisplay(nextEntry.route_ref.vendor, nextEntry.route_ref.route)} (${nextEntry.model_id}, ${source})`,
+        `[${EXT}] ${routeDisplay(resolved.vendor, route)} hit ${triggerLabel}. Switching to ${routeDisplay(nextEntry.route_ref.vendor, nextEntry.route_ref.route)} (${nextEntry.model_id}).`,
         "warning",
       );
     }
@@ -3999,6 +4078,10 @@ export default function (pi: ExtensionAPI): void {
         !lastPrompt.images || lastPrompt.images.length === 0
           ? lastPrompt.text
           : [{ type: "text", text: lastPrompt.text }, ...lastPrompt.images];
+
+      if (ctx.hasUI) {
+        ctx.ui.notify(`[${EXT}] Retrying your last prompt on the new route…`, "info");
+      }
 
       if (typeof ctx.isIdle === "function" && ctx.isIdle()) {
         pi.sendUserMessage(content);
