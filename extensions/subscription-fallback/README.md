@@ -243,5 +243,5 @@ Keep provider ids stable to avoid unnecessary re-login.
 - If a stack entry omits `model`, it follows current `/model`.
 - `failover.scope=current_vendor` restricts failover/return to current vendor.
 - Context-window errors are ignored for failover triggering.
-- In interactive UI, `ready` state is colorized (theme `success`) in status displays and footer status text.
+- In interactive UI, status is color-coded (auth type + route state), including `ready` (green), cooldown/waiting (yellow), and unavailable/credentials-needed (red).
 - Retry/holdoff windows in status + notifications are formatted as human-readable durations with local-time "until" timestamps.

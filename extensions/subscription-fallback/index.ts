@@ -2057,10 +2057,17 @@ export default function (pi: ExtensionAPI): void {
     }
 
     const stateText = humanReadableRouteState(state, cooldownUntil);
-    const stateDisplay = stateText === "ready" ? ctx.ui.theme.fg("success", stateText) : stateText;
+    let stateDisplay = stateText;
+    if (stateText === "ready") {
+      stateDisplay = ctx.ui.theme.fg("success", stateText);
+    } else if (stateText.startsWith("cooling down") || stateText === "waiting for current /model") {
+      stateDisplay = ctx.ui.theme.fg("warning", stateText);
+    } else if (stateText === "model unavailable" || stateText === "credentials needed") {
+      stateDisplay = ctx.ui.theme.fg("error", stateText);
+    }
 
     let msg = ctx.ui.theme.fg("muted", `${EXT}:`);
-    msg += " " + ctx.ui.theme.fg("accent", route.auth_type === "oauth" ? "sub" : "api");
+    msg += " " + ctx.ui.theme.fg(route.auth_type === "oauth" ? "success" : "warning", route.auth_type === "oauth" ? "sub" : "api");
     msg += " " + ctx.ui.theme.fg("dim", `${resolved.vendor}/${route.label}`);
     msg += " " + ctx.ui.theme.fg("dim", modelId);
     msg += " " + stateDisplay;
@@ -2071,22 +2078,46 @@ export default function (pi: ExtensionAPI): void {
     ctx.ui.setStatus(EXT, msg);
   }
 
-  function buildStatusLines(ctx: any, detailed = false, colorizeReady = false): string[] {
+  function buildStatusLines(ctx: any, detailed = false, colorize = false): string[] {
     if (!cfg) return ["(no config loaded)"];
 
     const lines: string[] = [];
 
-    const displayState = (state: string, cooldownUntilMs?: number): string => {
+    const paint = (color: string, text: string): string => {
+      if (!colorize || !ctx.hasUI) return text;
+      return ctx.ui.theme.fg(color as any, text);
+    };
+
+    const paintAuthType = (authType: AuthType): string => {
+      if (authType === "oauth") return paint("success", "oauth");
+      return paint("warning", "api_key");
+    };
+
+    const paintState = (state: string, cooldownUntilMs?: number): string => {
       const text = humanReadableRouteState(state, cooldownUntilMs);
-      if (text === "ready" && colorizeReady && ctx.hasUI) {
-        return ctx.ui.theme.fg("success", text);
+      if (text === "ready") return paint("success", text);
+      if (text.startsWith("cooling down") || text === "waiting for current /model") {
+        return paint("warning", text);
+      }
+      if (text === "model unavailable" || text === "credentials needed") {
+        return paint("error", text);
       }
       return text;
     };
 
+    const renderRoute = (
+      vendor: string,
+      route: { auth_type: AuthType; label: string },
+    ): string => {
+      if (!colorize || !ctx.hasUI) return routeDisplay(vendor, route);
+      return `${paint("dim", vendor)} · ${paintAuthType(route.auth_type)} · ${paint("dim", decode(route.label))}`;
+    };
+
     const currentProvider = ctx.model?.provider;
     const currentModel = ctx.model?.id;
-    const currentResolved = currentProvider ? resolveVendorRouteForProvider(currentProvider) : undefined;
+    const currentResolved = currentProvider
+      ? resolveVendorRouteForProvider(currentProvider)
+      : undefined;
     const currentRoute = currentResolved
       ? getRoute(currentResolved.vendor, currentResolved.index)
       : undefined;
@@ -2098,7 +2129,7 @@ export default function (pi: ExtensionAPI): void {
       );
 
       if (nextReturnEligibleAtMs > now()) {
-        lines.push(`return holdoff: ${formatRetryWindow(nextReturnEligibleAtMs)}`);
+        lines.push(paint("warning", `return holdoff: ${formatRetryWindow(nextReturnEligibleAtMs)}`));
       }
 
       if (currentProvider && currentModel) {
@@ -2106,12 +2137,12 @@ export default function (pi: ExtensionAPI): void {
       }
     }
 
-    lines.push("preference_stack:");
+    lines.push(paint("accent", "preference_stack:"));
     for (let i = 0; i < cfg.preference_stack.length; i++) {
       const entry = cfg.preference_stack[i];
       const ref = resolveRouteById(entry.route_id);
       if (!ref) {
-        lines.push(`  ${i + 1}. [missing route_id=${entry.route_id}]`);
+        lines.push(`  ${i + 1}. ${paint("error", `[missing route_id=${entry.route_id}]`)}`);
         continue;
       }
 
@@ -2135,32 +2166,34 @@ export default function (pi: ExtensionAPI): void {
         state = "missing_credentials";
       }
 
-      const activeMark = isActive ? "*" : " ";
-      const stateDisplay = displayState(state, cooldownUntil);
+      const activeMark = isActive ? paint("success", "*") : " ";
+      const stateDisplay = paintState(state, cooldownUntil);
       if (detailed) {
         const modelOverridePart = entry.model ? `, model_override=${entry.model}` : "";
         lines.push(
-          `  ${activeMark} ${i + 1}. ${routeDisplay(ref.vendor, ref.route)} (id=${ref.route.id}, provider=${ref.route.provider_id}${modelOverridePart}, ${stateDisplay})`,
+          `  ${activeMark} ${i + 1}. ${renderRoute(ref.vendor, ref.route)} (id=${ref.route.id}, provider=${ref.route.provider_id}${modelOverridePart}, ${stateDisplay})`,
         );
       } else {
         lines.push(
-          `  ${activeMark} ${i + 1}. ${routeDisplay(ref.vendor, ref.route)} (${stateDisplay})`,
+          `  ${activeMark} ${i + 1}. ${renderRoute(ref.vendor, ref.route)} (${stateDisplay})`,
         );
       }
     }
 
     if (detailed) {
       for (const v of cfg.vendors) {
-        lines.push(`vendor ${v.vendor}:`);
+        lines.push(paint("accent", `vendor ${v.vendor}:`));
         for (let i = 0; i < v.routes.length; i++) {
           const route = v.routes[i];
-          const active = activeRouteIndexByVendor.get(v.vendor) === i ? "*" : " ";
+          const active =
+            activeRouteIndexByVendor.get(v.vendor) === i
+              ? paint("success", "*")
+              : " ";
           const routeState = isRouteCoolingDown(v.vendor, i) ? "cooldown" : "ready";
-          const cooldownUntil = routeState === "cooldown"
-            ? getRouteCooldownUntil(v.vendor, i)
-            : undefined;
+          const cooldownUntil =
+            routeState === "cooldown" ? getRouteCooldownUntil(v.vendor, i) : undefined;
           lines.push(
-            `  ${active} ${i + 1}. ${route.auth_type} ${decode(route.label)} (id=${route.id}, provider=${route.provider_id}, ${displayState(routeState, cooldownUntil)})`,
+            `  ${active} ${i + 1}. ${paintAuthType(route.auth_type)} ${paint("dim", decode(route.label))} (id=${route.id}, provider=${route.provider_id}, ${paintState(routeState, cooldownUntil)})`,
           );
         }
       }
