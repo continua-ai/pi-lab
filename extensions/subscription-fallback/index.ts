@@ -1457,6 +1457,12 @@ export default function (pi: ExtensionAPI): void {
     return next;
   }
 
+  function nextBackgroundCheckHint(): string {
+    const next = computeNextRecoveryEvent();
+    if (next && next > now()) return ` Next check in ${formatRetryWindow(next)}.`;
+    return " We'll try again on the next idle check.";
+  }
+
   function extractCodexAccountId(token: string): string | undefined {
     try {
       const parts = token.split(".");
@@ -1860,7 +1866,7 @@ export default function (pi: ExtensionAPI): void {
 
     if (!switched && ctx.hasUI) {
       ctx.ui.notify(
-        `${EXT_NOTIFY} Preferred route looks healthy, but switching failed. Staying on ${routeDisplay(resolved.vendor, currentRoute)}.`,
+        `${EXT_NOTIFY} Preferred route looks healthy, but switching failed. Staying on ${routeDisplay(resolved.vendor, currentRoute)}.${nextBackgroundCheckHint()}`,
         "warning",
       );
     }
@@ -4177,6 +4183,12 @@ export default function (pi: ExtensionAPI): void {
     );
 
     if (!switched) {
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          `${EXT_NOTIFY} Could not switch to fallback route. Staying on ${routeDisplay(resolved.vendor, route)}. Next retry in ${formatRetryWindow(until)}.`,
+          "warning",
+        );
+      }
       scheduleRetryTimer(ctx);
       updateStatus(ctx);
       return;
