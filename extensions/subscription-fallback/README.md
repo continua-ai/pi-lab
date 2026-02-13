@@ -30,8 +30,13 @@ policy and clear user-facing status.
   - per-route cooldowns
   - return holdoff (`next_return_eligible_at_ms`)
 - Concise + detailed status surfaces with colorized state.
-- Guided setup wizard (apply-on-finish; cancel leaves existing config unchanged).
+- `/subswitch explain` decision trace (current route, stack, ineligibility reasons).
+- Decision event log (`/subswitch events [N]`) with timestamps, reasons, and next retry.
+- Guided setup wizard (apply-on-finish; cancel leaves existing config unchanged),
+  including a final **Validate now** step with interactive fix actions.
 - OAuth login reminder widget + `/subswitch login` flow.
+- Continuation fallback command (`/subswitch continue`) for reduced-carryover
+  new-session recovery when in-session switching is insufficient.
 - LLM-callable tool bridge: `subswitch_manage`.
 
 ---
@@ -95,18 +100,25 @@ If `model` is omitted, subswitch follows current `/model`.
 4. Set failover policy options.
 5. Review/reorder preference stack.
 6. Finish setup (writes config atomically only at the end).
+   - Optional: choose **Validate now** on the final wizard screen.
 7. Run `/subswitch login` and complete OAuth login(s) via `/login`.
 8. Ensure API-key env vars exist for `api_key` routes.
 9. Verify:
    - `/subswitch login-status`
    - `/subswitch status`
    - `/subswitch longstatus`
+   - `/subswitch explain`
 
 Wizard behavior notes:
 
 - Back navigation is supported across screens.
 - `Continue` is first in toggle menus for Enter-safe progression.
 - Route IDs are preserved where possible when editing existing vendor routes.
+- Final step includes **Validate now**, which can:
+  - re-check OAuth/auth material
+  - flag API-key env gaps
+  - verify current model compatibility
+  - run compaction immediately when context fit blocks preferred candidates
 
 ---
 
@@ -183,7 +195,7 @@ If no `subswitch.json` exists, subswitch attempts runtime migration from legacy
 
 ### Runtime state files
 
-State includes route cooldowns + return holdoff:
+State includes route cooldowns, return holdoff, and recent decision events:
 
 - Global: `~/.pi/agent/subswitch-state.json`
 - Project: `./.pi/subswitch-state.json`
@@ -196,7 +208,8 @@ State keying is based on route `id`.
 - `/reload` -> reload extension code/resources (full runtime reload).
 
 State is loaded on session start/switch and on `/subswitch reload`.
-State is persisted on session shutdown and when cooldown/holdoff values change.
+State is persisted on session shutdown and when cooldown/holdoff/decision-event
+state changes.
 
 ---
 
@@ -212,6 +225,10 @@ All control is via `/subswitch`.
   - Concise, stack-first status.
 - `/subswitch longstatus`
   - Detailed status (models, provider IDs, route IDs, per-vendor route view).
+- `/subswitch explain`
+  - Decision trace: current route/model, stack candidates, explicit ineligibility reasons.
+- `/subswitch events [limit]`
+  - Show recent routing decisions (default 20, max 200).
 - `/subswitch help`
   - Print command help.
 - `/subswitch setup`
@@ -233,6 +250,9 @@ All control is via `/subswitch`.
   - Use OAuth route.
 - `/subswitch api <vendor> [label] [modelId]`
   - Use API-key route.
+- `/subswitch continue [vendor auth_type label [modelId]]`
+  - Start reduced-carryover continuation in a new session targeting the selected
+    route/model (or the next eligible fallback target).
 
 ### Config editing commands
 
@@ -256,10 +276,13 @@ Supported actions:
 
 - `status`
 - `longstatus`
+- `explain`
+- `events`
 - `reload`
 - `use`
 - `prefer`
 - `rename`
+- `continue`
 
 Parameters:
 
@@ -267,6 +290,7 @@ Parameters:
 - `auth_type` (`oauth` | `api_key`)
 - `label`
 - `model_id` (optional)
+- `limit` (optional, for `events`)
 - `old_label` / `new_label` (rename)
 
 ---
@@ -369,6 +393,6 @@ Time windows are reported as human-readable durations plus local
   classification; context fit is handled by eligibility + compaction paths.
 - `failover.scope=current_vendor` restricts failover/return to current vendor.
 - `off` disables runtime behavior without rewriting config.
-- Extremely large histories where no route can compact currently remain in
-  stay-and-retry mode; continuation/map-reduce fallback is documented in:
-  `context-window-failover-design.md`.
+- Extremely large histories may still require explicit continuation fallback
+  (`/subswitch continue`) if automatic in-session compaction + switching cannot
+  recover.

@@ -59,7 +59,7 @@ If no fallback route is eligible and one or more routes are blocked by context s
 
 If a direct switch attempt is context-blocked (e.g. manual `/subswitch use`), compact first and retry the switch.
 
-### 3) Continuation fallback (design target)
+### 3) Continuation fallback (phase 1 shipped)
 
 If current route cannot compact and no route can fit context:
 
@@ -68,14 +68,16 @@ If current route cannot compact and no route can fit context:
   - compacted state summary
   - unresolved tasks + constraints
 
-For very large histories, use hierarchical map-reduce compaction:
+Current implementation provides this via `/subswitch continue` (and tool action
+`action=continue`) and attempts map-reduce carryover summarization before
+falling back to heuristic summarization.
+
+For very large histories, map-reduce compaction uses:
 
 1. split history into chunks that fit a helper route
 2. summarize chunks independently
 3. merge summaries
-4. recurse if merge output is still too large
-
-This is intentionally staged for later work.
+4. fallback to heuristic summary if map-reduce fails
 
 ### 4) Return-to-preferred behavior
 
@@ -96,9 +98,12 @@ If preferred route is context-blocked, remain on fallback and surface status as 
 - Automatic compaction-and-retry path before failover retry.
 - Pre-switch compaction-and-retry for direct route switches.
 - Status state: `context too large for target model`.
+- Continuation fallback command (`/subswitch continue`) with reduced-carryover
+  new-session recovery.
+- Map-reduce carryover summarization with heuristic fallback.
 
 ## Follow-up work
 
-- Continuation fallback session flow when compaction is impossible.
-- Hierarchical map-reduce compaction pipeline for extreme histories.
+- Automatically trigger continuation fallback when failover + compaction paths
+  are exhausted (currently user/tool-invoked).
 - Better per-provider/account window metadata (if runtime exposes it).

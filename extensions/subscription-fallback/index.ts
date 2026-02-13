@@ -193,10 +193,36 @@ interface OriginalEnv {
   anthropic_api_key?: string;
 }
 
+type DecisionEventLevel = "info" | "warning";
+
+type DecisionEventKind =
+  | "failover_trigger"
+  | "failover_switch"
+  | "failover_stay"
+  | "no_fallback"
+  | "return_probe"
+  | "return_switch"
+  | "return_stay"
+  | "manual_switch"
+  | "manual_switch_stay"
+  | "compaction"
+  | "continuation"
+  | "auto_retry";
+
+interface DecisionEvent {
+  ts_ms: number;
+  kind: DecisionEventKind;
+  level: DecisionEventLevel;
+  message: string;
+  reason?: string;
+  next_retry_at_ms?: number;
+}
+
 interface PersistedState {
   version?: number;
   route_cooldown_until?: Record<string, number>;
   next_return_eligible_at_ms?: number;
+  decision_events?: DecisionEvent[];
 }
 
 interface RouteProbeResult {
@@ -225,6 +251,19 @@ interface FallbackSelectionResult {
   entry?: EffectivePreferenceEntry;
   context_blocked: number;
   first_context_blocked?: EffectivePreferenceEntry;
+}
+
+interface ContinuationTarget {
+  vendor: string;
+  routeIndex: number;
+  route: NormalizedRoute;
+  modelId: string;
+}
+
+interface ContinuationSummaryResult {
+  ok: boolean;
+  summary?: string;
+  message?: string;
 }
 
 const decode = (s: string): string => {
@@ -987,6 +1026,9 @@ export default function (pi: ExtensionAPI): void {
   // Per-route cooldown state. Key: route_id => epoch ms.
   const routeCooldownUntil = new Map<string, number>();
 
+  // Rolling decision/event log used for /subswitch events and diagnostics.
+  const decisionEvents: DecisionEvent[] = [];
+
   // Persistent runtime state path (project or global, based on active config location).
   let statePath: string | undefined;
 
@@ -1022,6 +1064,12 @@ export default function (pi: ExtensionAPI): void {
   const SWITCH_CONTEXT_RESERVE_RATIO = 0.15;
   const SWITCH_CONTEXT_RESERVE_MIN_TOKENS = 16_384;
   const SWITCH_COMPACTION_TIMEOUT_MS = 120_000;
+  const DECISION_EVENT_MAX = 200;
+  const DECISION_EVENT_DEFAULT_LIMIT = 20;
+
+  const CONTINUATION_CHUNK_CHARS = 18_000;
+  const CONTINUATION_MAX_CHUNKS = 8;
+  const CONTINUATION_MAX_LINES_PER_CHUNK = 60;
 
   function now(): number {
     return Date.now();
@@ -1090,6 +1138,94 @@ export default function (pi: ExtensionAPI): void {
 
   function formatRetryWindow(untilMs: number): string {
     return `~${formatDurationCompact(untilMs - now())} (${formatUntilLocal(untilMs)})`;
+  }
+
+  function formatTimestampLocal(tsMs: number): string {
+    const d = new Date(tsMs);
+    return d.toLocaleString([], {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  }
+
+  function isDecisionEventLevel(level: string): level is DecisionEventLevel {
+    return level === "info" || level === "warning";
+  }
+
+  function isDecisionEventKind(kind: string): kind is DecisionEventKind {
+    return [
+      "failover_trigger",
+      "failover_switch",
+      "failover_stay",
+      "no_fallback",
+      "return_probe",
+      "return_switch",
+      "return_stay",
+      "manual_switch",
+      "manual_switch_stay",
+      "compaction",
+      "continuation",
+      "auto_retry",
+    ].includes(kind);
+  }
+
+  function recordDecisionEvent(event: DecisionEvent): void {
+    decisionEvents.push({
+      ...event,
+      ts_ms: Number.isFinite(event.ts_ms) ? Math.floor(event.ts_ms) : now(),
+    });
+
+    if (decisionEvents.length > DECISION_EVENT_MAX) {
+      decisionEvents.splice(0, decisionEvents.length - DECISION_EVENT_MAX);
+    }
+
+    persistRuntimeState();
+  }
+
+  function notifyDecision(
+    ctx: any,
+    level: DecisionEventLevel,
+    kind: DecisionEventKind,
+    message: string,
+    options?: { reason?: string; nextRetryAtMs?: number; silent?: boolean },
+  ): void {
+    recordDecisionEvent({
+      ts_ms: now(),
+      kind,
+      level,
+      message,
+      reason: options?.reason,
+      next_retry_at_ms: options?.nextRetryAtMs,
+    });
+
+    if (!options?.silent && ctx.hasUI) {
+      ctx.ui.notify(`${EXT_NOTIFY} ${message}`, level);
+    }
+  }
+
+  function buildDecisionEventLines(limit = DECISION_EVENT_DEFAULT_LIMIT): string[] {
+    const safeLimit = Math.max(1, Math.floor(limit));
+    const recent = decisionEvents.slice(-safeLimit);
+
+    if (recent.length === 0) {
+      return [`${EXT_NOTIFY} No subswitch events recorded yet.`];
+    }
+
+    const lines: string[] = [`${EXT_NOTIFY} Last ${recent.length} subswitch event(s):`];
+    for (const event of recent) {
+      const level = event.level.toUpperCase();
+      let line = `- [${formatTimestampLocal(event.ts_ms)}] [${level}] ${event.kind}: ${event.message}`;
+      if (event.reason) line += ` | reason=${event.reason}`;
+      if (event.next_retry_at_ms && event.next_retry_at_ms > 0) {
+        line += ` | next=${formatRetryWindow(event.next_retry_at_ms)}`;
+      }
+      lines.push(line);
+    }
+
+    return lines;
   }
 
   function humanReadableRouteState(
@@ -1186,6 +1322,17 @@ export default function (pi: ExtensionAPI): void {
     if (!cfg?.failover.return_to_preferred.enabled || nextReturnEligibleAtMs <= currentTs) {
       nextReturnEligibleAtMs = 0;
     }
+
+    // Keep decision log bounded and well-formed.
+    for (let i = decisionEvents.length - 1; i >= 0; i--) {
+      const event = decisionEvents[i];
+      if (!event || !Number.isFinite(Number(event.ts_ms))) {
+        decisionEvents.splice(i, 1);
+      }
+    }
+    if (decisionEvents.length > DECISION_EVENT_MAX) {
+      decisionEvents.splice(0, decisionEvents.length - DECISION_EVENT_MAX);
+    }
   }
 
   function buildPersistedState(): PersistedState {
@@ -1205,6 +1352,10 @@ export default function (pi: ExtensionAPI): void {
       state.next_return_eligible_at_ms = Math.floor(nextReturnEligibleAtMs);
     }
 
+    if (decisionEvents.length > 0) {
+      state.decision_events = decisionEvents.slice(-DECISION_EVENT_MAX);
+    }
+
     return state;
   }
 
@@ -1218,6 +1369,7 @@ export default function (pi: ExtensionAPI): void {
     statePath = preferredWritableStatePath(ctx.cwd);
 
     routeCooldownUntil.clear();
+    decisionEvents.splice(0, decisionEvents.length);
     nextReturnEligibleAtMs = 0;
 
     const candidates = statePathCandidates(ctx.cwd);
@@ -1238,6 +1390,28 @@ export default function (pi: ExtensionAPI): void {
       const holdoff = Number(raw.next_return_eligible_at_ms);
       if (Number.isFinite(holdoff) && holdoff > now()) {
         nextReturnEligibleAtMs = Math.floor(holdoff);
+      }
+
+      const events = Array.isArray(raw.decision_events) ? raw.decision_events : [];
+      for (const event of events.slice(-DECISION_EVENT_MAX)) {
+        if (!event || typeof event !== "object") continue;
+        const ts = Number((event as any).ts_ms);
+        const message = String((event as any).message ?? "").trim();
+        const kindRaw = String((event as any).kind ?? "").trim();
+        const levelRaw = String((event as any).level ?? "").trim();
+        if (!Number.isFinite(ts) || !message || !isDecisionEventKind(kindRaw) || !isDecisionEventLevel(levelRaw)) {
+          continue;
+        }
+        const nextRetry = Number((event as any).next_retry_at_ms);
+        const reasonRaw = String((event as any).reason ?? "").trim();
+        decisionEvents.push({
+          ts_ms: Math.floor(ts),
+          kind: kindRaw,
+          level: levelRaw,
+          message,
+          reason: reasonRaw || undefined,
+          next_retry_at_ms: Number.isFinite(nextRetry) ? Math.floor(nextRetry) : undefined,
+        });
       }
 
       break;
@@ -1519,6 +1693,146 @@ export default function (pi: ExtensionAPI): void {
     const window = Number(fit.target_context_window ?? 0).toLocaleString();
 
     return `current ~${source} tokens (estimated ~${estimate} on target) exceeds safe budget ~${budget}/${window}`;
+  }
+
+  function reasonLabel(reason: RouteIneligibleReason): string {
+    if (reason === "cooldown") return "cooldown";
+    if (reason === "model_unavailable") return "model unavailable";
+    if (reason === "missing_credentials") return "credentials needed";
+    if (reason === "context_too_large") return "context blocked";
+    return reason;
+  }
+
+  function reasonDetails(
+    ctx: any,
+    ref: ResolvedRouteRef,
+    modelId: string,
+    reason: RouteIneligibleReason,
+  ): string {
+    if (reason === "cooldown") {
+      const until = getRouteCooldownUntil(ref.vendor, ref.index);
+      return until > now() ? formatRetryWindow(until) : "cooldown active";
+    }
+
+    if (reason === "model_unavailable") {
+      return `${ref.route.provider_id}/${modelId} not found`;
+    }
+
+    if (reason === "missing_credentials") {
+      if (ref.route.auth_type === "oauth") {
+        return `oauth login needed for provider '${ref.route.provider_id}'`;
+      }
+      const envHint = ref.route.api_key_env ? `env ${ref.route.api_key_env}` : "api key missing";
+      return envHint;
+    }
+
+    if (reason === "context_too_large") {
+      return contextFitSummary(contextFitForRouteModel(ctx, ref.route, modelId));
+    }
+
+    return reason;
+  }
+
+  function buildExplainLines(ctx: any): string[] {
+    if (!cfg) return [`${EXT_NOTIFY} No config loaded.`];
+
+    const currentProvider = ctx.model?.provider;
+    const currentModel = ctx.model?.id;
+    if (!currentProvider || !currentModel) {
+      return [`${EXT_NOTIFY} No active model selected.`];
+    }
+
+    const resolved = resolveVendorRouteForProvider(currentProvider);
+    if (!resolved) {
+      return [
+        `${EXT_NOTIFY} Active provider '${currentProvider}' is not mapped to a subswitch route.`,
+      ];
+    }
+
+    const currentRoute = getRoute(resolved.vendor, resolved.index);
+    if (!currentRoute) {
+      return [`${EXT_NOTIFY} Active route mapping is unavailable.`];
+    }
+
+    const usage = typeof ctx.getContextUsage === "function"
+      ? ctx.getContextUsage()
+      : undefined;
+
+    const lines: string[] = [];
+    lines.push(`${EXT_NOTIFY} decision explain`);
+    lines.push(`current route: ${routeDisplay(resolved.vendor, currentRoute)}`);
+    lines.push(`current model: ${currentProvider}/${currentModel}`);
+    if (usage && Number.isFinite(Number(usage.tokens))) {
+      const tokens = Number(usage.tokens).toLocaleString();
+      const window = Number(usage.contextWindow ?? 0).toLocaleString();
+      lines.push(`current context: ~${tokens} tokens (window ${window})`);
+    }
+
+    const effective = buildEffectivePreferenceStack(resolved.vendor, currentModel);
+    if (effective.length === 0) {
+      lines.push("effective stack: (empty)");
+      return lines;
+    }
+
+    const currentIdx = findCurrentEffectiveStackIndex(effective, currentRoute.id, currentModel);
+    lines.push("effective candidates:");
+
+    for (let i = 0; i < effective.length; i++) {
+      const entry = effective[i];
+      const mark = currentIdx === i ? "*" : " ";
+      const reason = routeIneligibleReason(
+        ctx,
+        entry.route_ref.vendor,
+        entry.route_ref.index,
+        entry.model_id,
+      );
+
+      if (!reason) {
+        const status = currentIdx === i ? "active" : "eligible";
+        lines.push(
+          `  ${mark} ${i + 1}. ${routeDisplay(entry.route_ref.vendor, entry.route_ref.route)} (${entry.model_id}) -> ${status}`,
+        );
+      } else {
+        const detail = reasonDetails(ctx, entry.route_ref, entry.model_id, reason);
+        lines.push(
+          `  ${mark} ${i + 1}. ${routeDisplay(entry.route_ref.vendor, entry.route_ref.route)} (${entry.model_id}) -> ineligible: ${reasonLabel(reason)} (${detail})`,
+        );
+      }
+    }
+
+    let nextEligible: EffectivePreferenceEntry | undefined;
+    const start = currentIdx === undefined ? 0 : currentIdx + 1;
+    for (let i = start; i < effective.length; i++) {
+      const entry = effective[i];
+      if (!routeIneligibleReason(ctx, entry.route_ref.vendor, entry.route_ref.index, entry.model_id)) {
+        nextEligible = entry;
+        break;
+      }
+    }
+
+    if (nextEligible) {
+      lines.push(
+        `next fallback candidate: ${routeDisplay(nextEligible.route_ref.vendor, nextEligible.route_ref.route)} (${nextEligible.model_id})`,
+      );
+    } else {
+      lines.push("next fallback candidate: none");
+    }
+
+    return lines;
+  }
+
+  function switchDecisionKind(reason: string, success: boolean): DecisionEventKind {
+    const r = String(reason ?? "").toLowerCase();
+
+    if (r.includes("rate") || r.includes("quota") || r.includes("auth error")) {
+      return success ? "failover_switch" : "failover_stay";
+    }
+
+    if (r.includes("before turn") || r.includes("cooldown expired") || r.includes("probe")) {
+      return success ? "return_switch" : "return_stay";
+    }
+
+    return success ? "manual_switch" : "manual_switch_stay";
   }
 
   async function runSwitchCompaction(
@@ -1974,23 +2288,25 @@ export default function (pi: ExtensionAPI): void {
     const targetVendorCfg = getVendor(target.route_ref.vendor);
     if (!targetVendorCfg) return;
 
-    if (ctx.hasUI) {
-      ctx.ui.notify(
-        `${EXT_NOTIFY} Checking whether preferred route is healthy: ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})…`,
-        "info",
-      );
-    }
+    notifyDecision(
+      ctx,
+      "info",
+      "return_probe",
+      `Checking whether preferred route is healthy: ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})…`,
+      { reason },
+    );
 
     const probe = await probeRouteModel(ctx, target.route_ref, target.model_id);
     if (!probe.ok) {
       if (probe.inconclusive) {
-        if (ctx.hasUI) {
-          const detail = probe.message ? ` (${probe.message})` : "";
-          ctx.ui.notify(
-            `${EXT_NOTIFY} Preferred route check was inconclusive${detail}. Trying a direct switch to ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})…`,
-            "info",
-          );
-        }
+        const detail = probe.message ? ` (${probe.message})` : "";
+        notifyDecision(
+          ctx,
+          "info",
+          "return_probe",
+          `Preferred route check was inconclusive${detail}. Trying a direct switch to ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})…`,
+          { reason: probe.message },
+        );
 
         const switchedAfterInconclusiveProbe = await switchToRoute(
           ctx,
@@ -2001,12 +2317,13 @@ export default function (pi: ExtensionAPI): void {
           false,
         );
         if (switchedAfterInconclusiveProbe) {
-          if (ctx.hasUI) {
-            ctx.ui.notify(
-              `${EXT_NOTIFY} Successfully switched back to preferred route: ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id}).`,
-              "info",
-            );
-          }
+          notifyDecision(
+            ctx,
+            "info",
+            "return_switch",
+            `Successfully switched back to preferred route: ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id}).`,
+            { reason },
+          );
           return;
         }
       }
@@ -2019,20 +2336,30 @@ export default function (pi: ExtensionAPI): void {
       const cooldownUntil = now() + cooldownMs;
       setRouteCooldownUntil(target.route_ref.vendor, target.route_ref.index, cooldownUntil);
 
-      if (ctx.hasUI) {
-        if (probe.inconclusive) {
-          const reasonText = probe.message ? ` Last check: ${probe.message}.` : "";
-          ctx.ui.notify(
-            `${EXT_NOTIFY} Stayed on ${routeDisplay(resolved.vendor, currentRoute)} for now. Preferred route check was inconclusive and direct switch did not succeed. Next check in ${formatRetryWindow(cooldownUntil)}.${reasonText}`,
-            "info",
-          );
-        } else {
-          const reasonText = probe.message ? ` Reason: ${probe.message}` : "";
-          ctx.ui.notify(
-            `${EXT_NOTIFY} Preferred route still unavailable. Staying on ${routeDisplay(resolved.vendor, currentRoute)}. Next check in ${formatRetryWindow(cooldownUntil)}.${reasonText}`,
-            "warning",
-          );
-        }
+      if (probe.inconclusive) {
+        const reasonText = probe.message ? ` Last check: ${probe.message}.` : "";
+        notifyDecision(
+          ctx,
+          "info",
+          "return_stay",
+          `Stayed on ${routeDisplay(resolved.vendor, currentRoute)} for now. Preferred route check was inconclusive and direct switch did not succeed. Next check in ${formatRetryWindow(cooldownUntil)}.${reasonText}`,
+          {
+            reason: probe.message,
+            nextRetryAtMs: cooldownUntil,
+          },
+        );
+      } else {
+        const reasonText = probe.message ? ` Reason: ${probe.message}` : "";
+        notifyDecision(
+          ctx,
+          "warning",
+          "return_stay",
+          `Preferred route still unavailable. Staying on ${routeDisplay(resolved.vendor, currentRoute)}. Next check in ${formatRetryWindow(cooldownUntil)}.${reasonText}`,
+          {
+            reason: probe.message,
+            nextRetryAtMs: cooldownUntil,
+          },
+        );
       }
 
       scheduleRetryTimer(ctx);
@@ -2044,12 +2371,13 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
-    if (ctx.hasUI) {
-      ctx.ui.notify(
-        `${EXT_NOTIFY} Preferred route is healthy again. Switching to ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id}).`,
-        "info",
-      );
-    }
+    notifyDecision(
+      ctx,
+      "info",
+      "return_probe",
+      `Preferred route is healthy again. Switching to ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id}).`,
+      { reason },
+    );
 
     const switched = await switchToRoute(
       ctx,
@@ -2060,10 +2388,13 @@ export default function (pi: ExtensionAPI): void {
       true,
     );
 
-    if (!switched && ctx.hasUI) {
-      ctx.ui.notify(
-        `${EXT_NOTIFY} Preferred route looks healthy, but switching failed. Staying on ${routeDisplay(resolved.vendor, currentRoute)}.${nextBackgroundCheckHint()}`,
+    if (!switched) {
+      notifyDecision(
+        ctx,
         "warning",
+        "return_stay",
+        `Preferred route looks healthy, but switching failed. Staying on ${routeDisplay(resolved.vendor, currentRoute)}.${nextBackgroundCheckHint()}`,
+        { reason },
       );
     }
   }
@@ -2496,6 +2827,16 @@ export default function (pi: ExtensionAPI): void {
     ctx.ui.notify(buildStatusLines(ctx, detailed, true).join("\n"), "info");
   }
 
+  function notifyExplain(ctx: any): void {
+    if (!ctx.hasUI) return;
+    ctx.ui.notify(buildExplainLines(ctx).join("\n"), "info");
+  }
+
+  function notifyEvents(ctx: any, limit = DECISION_EVENT_DEFAULT_LIMIT): void {
+    if (!ctx.hasUI) return;
+    ctx.ui.notify(buildDecisionEventLines(limit).join("\n"), "info");
+  }
+
   function configuredOauthProviders(): string[] {
     if (!cfg) return [];
     const providers: string[] = [];
@@ -2602,6 +2943,468 @@ export default function (pi: ExtensionAPI): void {
     }
   }
 
+  function extractTextFromContent(content: any): string {
+    if (content === undefined || content === null) return "";
+    if (typeof content === "string") return content;
+
+    if (Array.isArray(content)) {
+      return content
+        .map((item) => {
+          if (typeof item === "string") return item;
+          if (!item || typeof item !== "object") return "";
+          if (item.type === "text" && typeof item.text === "string") return item.text;
+          if (typeof item.text === "string") return item.text;
+          return "";
+        })
+        .filter(Boolean)
+        .join("\n");
+    }
+
+    if (typeof content === "object") {
+      if (typeof content.text === "string") return content.text;
+      if (typeof content.content === "string") return content.content;
+    }
+
+    return String(content);
+  }
+
+  function extractMessageText(message: any): string {
+    if (!message || typeof message !== "object") return "";
+
+    const textFromContent = extractTextFromContent(message.content);
+    if (textFromContent.trim()) return textFromContent.trim();
+
+    const textFallback = [
+      message.text,
+      message.summary,
+      message.errorMessage,
+      message.error,
+      message.details?.error,
+    ]
+      .map((v) => (v ? String(v) : ""))
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+
+    return textFallback;
+  }
+
+  function buildContinuationTranscript(branchEntries: any[]): string {
+    const lines: string[] = [];
+
+    for (const entry of branchEntries) {
+      if (!entry || entry.type !== "message") continue;
+      const msg = entry.message;
+      const role = String(msg?.role ?? "").trim();
+      if (!role || (role !== "user" && role !== "assistant" && role !== "system")) continue;
+
+      const text = extractMessageText(msg);
+      if (!text) continue;
+
+      lines.push(`[${role}] ${text}`);
+    }
+
+    if (lines.length === 0) return "";
+
+    const cappedLines = lines.slice(-800);
+    return cappedLines.join("\n\n");
+  }
+
+  function splitTranscriptIntoChunks(text: string): string[] {
+    const normalized = String(text ?? "").trim();
+    if (!normalized) return [];
+
+    const lines = normalized.split("\n");
+    const chunks: string[] = [];
+
+    let currentLines: string[] = [];
+    let currentChars = 0;
+
+    const flush = () => {
+      if (currentLines.length === 0) return;
+      chunks.push(currentLines.join("\n"));
+      currentLines = [];
+      currentChars = 0;
+    };
+
+    for (const rawLine of lines) {
+      const line = rawLine.trimEnd();
+      const lineChars = line.length + 1;
+      const wouldOverflowChars = currentChars + lineChars > CONTINUATION_CHUNK_CHARS;
+      const wouldOverflowLines = currentLines.length >= CONTINUATION_MAX_LINES_PER_CHUNK;
+
+      if (currentLines.length > 0 && (wouldOverflowChars || wouldOverflowLines)) {
+        flush();
+        if (chunks.length >= CONTINUATION_MAX_CHUNKS) break;
+      }
+
+      currentLines.push(line);
+      currentChars += lineChars;
+
+      if (chunks.length >= CONTINUATION_MAX_CHUNKS) break;
+    }
+
+    flush();
+
+    if (chunks.length > CONTINUATION_MAX_CHUNKS) {
+      return chunks.slice(0, CONTINUATION_MAX_CHUNKS);
+    }
+
+    return chunks;
+  }
+
+  function latestCompactionSummary(branchEntries: any[]): string | undefined {
+    for (let i = branchEntries.length - 1; i >= 0; i--) {
+      const entry = branchEntries[i];
+      if (entry?.type !== "compaction") continue;
+      const summary = String(entry.summary ?? "").trim();
+      if (summary) return summary;
+    }
+    return undefined;
+  }
+
+  function latestAssistantMessageText(branchEntries: any[]): string | undefined {
+    for (let i = branchEntries.length - 1; i >= 0; i--) {
+      const entry = branchEntries[i];
+      if (entry?.type !== "message") continue;
+      const msg = entry.message;
+      if (String(msg?.role ?? "") !== "assistant") continue;
+      const text = extractMessageText(msg).trim();
+      if (text) return text;
+    }
+    return undefined;
+  }
+
+  function buildHeuristicContinuationSummary(ctx: any): string {
+    const branch = ctx.sessionManager.getBranch();
+    const compaction = latestCompactionSummary(branch);
+    const transcript = buildContinuationTranscript(branch);
+    const recentLines = transcript
+      ? transcript.split("\n").slice(-80).join("\n")
+      : "(no recent transcript available)";
+
+    const promptText = lastPrompt?.text?.trim() || "(no captured pending user prompt)";
+
+    const parts = [
+      "Carryover context (heuristic fallback):",
+      "",
+      `- Current model: ${ctx.model?.provider ?? "unknown"}/${ctx.model?.id ?? "unknown"}`,
+      `- Last user prompt: ${promptText}`,
+      "",
+      "Most recent compaction summary:",
+      compaction ? compaction : "(none)",
+      "",
+      "Recent transcript excerpt:",
+      recentLines,
+    ];
+
+    return parts.join("\n");
+  }
+
+  function requireContinuationCapabilities(ctx: any): { ok: boolean; message?: string } {
+    if (typeof ctx.newSession !== "function") {
+      return { ok: false, message: "newSession() is unavailable in this context" };
+    }
+    if (typeof ctx.switchSession !== "function") {
+      return { ok: false, message: "switchSession() is unavailable in this context" };
+    }
+    if (typeof ctx.waitForIdle !== "function") {
+      return { ok: false, message: "waitForIdle() is unavailable in this context" };
+    }
+    return { ok: true };
+  }
+
+  async function summarizeWithTargetRouteInTempSession(
+    ctx: any,
+    target: ContinuationTarget,
+    prompt: string,
+    label: string,
+  ): Promise<ContinuationSummaryResult> {
+    const capabilities = requireContinuationCapabilities(ctx);
+    if (!capabilities.ok) {
+      return { ok: false, message: capabilities.message };
+    }
+
+    const originalSessionPath = ctx.sessionManager.getSessionFile();
+    if (!originalSessionPath) {
+      return { ok: false, message: "unable to determine original session path" };
+    }
+
+    const created = await ctx.newSession();
+    if (created?.cancelled) {
+      return { ok: false, message: "temporary summarization session cancelled" };
+    }
+
+    try {
+      const switched = await switchToRoute(
+        ctx,
+        target.vendor,
+        target.routeIndex,
+        target.modelId,
+        `${label} (temp summary session)`,
+        false,
+      );
+      if (!switched) {
+        return {
+          ok: false,
+          message: `could not switch temporary session to ${target.route.provider_id}/${target.modelId}`,
+        };
+      }
+
+      pi.sendUserMessage(prompt);
+      await ctx.waitForIdle();
+
+      const summary = latestAssistantMessageText(ctx.sessionManager.getBranch());
+      if (!summary) {
+        return { ok: false, message: "no assistant summary generated in temporary session" };
+      }
+
+      return { ok: true, summary };
+    } finally {
+      await ctx.switchSession(originalSessionPath);
+    }
+  }
+
+  async function generateContinuationSummary(
+    ctx: any,
+    target: ContinuationTarget,
+  ): Promise<ContinuationSummaryResult> {
+    const branch = ctx.sessionManager.getBranch();
+    const transcript = buildContinuationTranscript(branch);
+
+    if (!transcript) {
+      return {
+        ok: true,
+        summary: buildHeuristicContinuationSummary(ctx),
+      };
+    }
+
+    const chunks = splitTranscriptIntoChunks(transcript);
+    if (chunks.length === 0) {
+      return {
+        ok: true,
+        summary: buildHeuristicContinuationSummary(ctx),
+      };
+    }
+
+    const partials: string[] = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const prompt = [
+        "You are preparing carryover context for a failover continuation session.",
+        "Summarize this transcript chunk with short sections:",
+        "- Open tasks",
+        "- Key decisions",
+        "- Constraints and preferences",
+        "- Important files and commands",
+        "- Current user intent",
+        "Keep it concise and factual. Do not invent details.",
+        "",
+        `<chunk index='${i + 1}' total='${chunks.length}'>`,
+        chunk,
+        "</chunk>",
+      ].join("\n");
+
+      const result = await summarizeWithTargetRouteInTempSession(
+        ctx,
+        target,
+        prompt,
+        `chunk-${i + 1}`,
+      );
+      if (!result.ok || !result.summary) {
+        return {
+          ok: false,
+          message: result.message ?? "chunk summarization failed",
+        };
+      }
+
+      partials.push(result.summary);
+    }
+
+    const mergePrompt = [
+      "Merge these partial carryover summaries into one compact continuation summary.",
+      "Preserve factual details and unresolved tasks. Remove duplicates.",
+      "Required sections:",
+      "- Open tasks",
+      "- Key decisions",
+      "- Constraints and preferences",
+      "- Important files and commands",
+      "- Current user intent",
+      "",
+      partials.map((s, i) => `<partial index='${i + 1}'>\n${s}\n</partial>`).join("\n\n"),
+    ].join("\n");
+
+    const merged = await summarizeWithTargetRouteInTempSession(
+      ctx,
+      target,
+      mergePrompt,
+      "merge",
+    );
+
+    if (!merged.ok || !merged.summary) {
+      return {
+        ok: false,
+        message: merged.message ?? "merge summarization failed",
+      };
+    }
+
+    return { ok: true, summary: merged.summary };
+  }
+
+  function resolveContinuationTarget(
+    ctx: any,
+    vendor?: string,
+    authType?: AuthType,
+    label?: string,
+    modelId?: string,
+  ): ContinuationTarget | undefined {
+    ensureCfg(ctx);
+
+    if (vendor && authType && label) {
+      const idx = findRouteIndex(vendor, authType, label);
+      if (idx === undefined) return undefined;
+      const route = getRoute(vendor, idx);
+      const targetModel = modelId ?? ctx.model?.id;
+      if (!route || !targetModel) return undefined;
+      return {
+        vendor,
+        routeIndex: idx,
+        route,
+        modelId: targetModel,
+      };
+    }
+
+    const currentProvider = ctx.model?.provider;
+    const currentModel = ctx.model?.id;
+    const currentResolved = currentProvider
+      ? resolveVendorRouteForProvider(currentProvider)
+      : undefined;
+
+    const effective = buildEffectivePreferenceStack(currentResolved?.vendor, currentModel);
+    for (const entry of effective) {
+      if (!entry.route_ref.route || !entry.model_id) continue;
+      if (currentResolved && entry.route_ref.route.id === getRoute(currentResolved.vendor, currentResolved.index)?.id) {
+        continue;
+      }
+
+      return {
+        vendor: entry.route_ref.vendor,
+        routeIndex: entry.route_ref.index,
+        route: entry.route_ref.route,
+        modelId: entry.model_id,
+      };
+    }
+
+    if (currentResolved && currentModel) {
+      const route = getRoute(currentResolved.vendor, currentResolved.index);
+      if (route) {
+        return {
+          vendor: currentResolved.vendor,
+          routeIndex: currentResolved.index,
+          route,
+          modelId: currentModel,
+        };
+      }
+    }
+
+    return undefined;
+  }
+
+  async function runContinuationFallback(
+    ctx: any,
+    target: ContinuationTarget,
+  ): Promise<{ ok: boolean; message: string }> {
+    const capabilities = requireContinuationCapabilities(ctx);
+    if (!capabilities.ok) {
+      return { ok: false, message: capabilities.message ?? "continuation helpers unavailable" };
+    }
+
+    notifyDecision(
+      ctx,
+      "info",
+      "continuation",
+      `Starting continuation fallback on ${routeDisplay(target.vendor, target.route)} (${target.modelId})…`,
+    );
+
+    const summaryResult = await generateContinuationSummary(ctx, target);
+    const continuationSummary = summaryResult.ok && summaryResult.summary
+      ? summaryResult.summary
+      : buildHeuristicContinuationSummary(ctx);
+
+    if (!summaryResult.ok) {
+      notifyDecision(
+        ctx,
+        "warning",
+        "continuation",
+        "Map-reduce continuation summary failed; falling back to heuristic carryover summary.",
+        { reason: summaryResult.message },
+      );
+    }
+
+    const created = await ctx.newSession();
+    if (created?.cancelled) {
+      return { ok: false, message: "continuation session creation cancelled" };
+    }
+
+    const switched = await switchToRoute(
+      ctx,
+      target.vendor,
+      target.routeIndex,
+      target.modelId,
+      "continuation fallback",
+      false,
+    );
+
+    if (!switched) {
+      return {
+        ok: false,
+        message: `continuation session created but switch failed for ${target.route.provider_id}/${target.modelId}`,
+      };
+    }
+
+    const summaryIntro = [
+      "Continuation context imported from previous session after failover.",
+      "Use this as carryover state and continue naturally.",
+      "",
+      `<carryover_summary>\n${continuationSummary}\n</carryover_summary>`,
+    ].join("\n");
+
+    pi.sendMessage(
+      {
+        customType: `${EXT}-continuation-carryover`,
+        content: summaryIntro,
+        display: true,
+        details: {
+          source: "subswitch_continuation",
+          target_provider: target.route.provider_id,
+          target_model: target.modelId,
+        },
+      },
+      { triggerTurn: false },
+    );
+
+    const latestPrompt = lastPrompt?.text?.trim();
+    if (latestPrompt) {
+      const content =
+        !lastPrompt.images || lastPrompt.images.length === 0
+          ? latestPrompt
+          : [{ type: "text", text: latestPrompt }, ...lastPrompt.images];
+      pi.sendUserMessage(content);
+    }
+
+    notifyDecision(
+      ctx,
+      "info",
+      "continuation",
+      `Continuation session ready on ${routeDisplay(target.vendor, target.route)} (${target.modelId}).${latestPrompt ? " Resent your latest prompt." : ""}`,
+    );
+
+    return {
+      ok: true,
+      message: `Continuation session started on ${target.route.provider_id}/${target.modelId}`,
+    };
+  }
+
   async function switchToRoute(
     ctx: any,
     vendor: string,
@@ -2617,10 +3420,13 @@ export default function (pi: ExtensionAPI): void {
     if (!vendorCfg || !route) return false;
 
     if (!routeCanHandleModel(ctx, route, modelId)) {
-      if (notify && ctx.hasUI) {
-        ctx.ui.notify(
-          `${EXT_NOTIFY} Route cannot serve model ${modelId}: ${routeDisplay(vendor, route)}`,
+      if (notify) {
+        notifyDecision(
+          ctx,
           "warning",
+          switchDecisionKind(reason, false),
+          `Route cannot serve model ${modelId}: ${routeDisplay(vendor, route)}`,
+          { reason },
         );
       }
       return false;
@@ -2629,10 +3435,13 @@ export default function (pi: ExtensionAPI): void {
     if (route.auth_type === "api_key") {
       const ok = applyApiRouteCredentials(vendor, route);
       if (!ok) {
-        if (notify && ctx.hasUI) {
-          ctx.ui.notify(
-            `${EXT_NOTIFY} Missing API key material for ${routeDisplay(vendor, route)} (check api_key_env/api_key_path/api_key)`,
+        if (notify) {
+          notifyDecision(
+            ctx,
             "warning",
+            switchDecisionKind(reason, false),
+            `Missing API key material for ${routeDisplay(vendor, route)} (check api_key_env/api_key_path/api_key)`,
+            { reason },
           );
         }
         return false;
@@ -2641,10 +3450,13 @@ export default function (pi: ExtensionAPI): void {
 
     const model = ctx.modelRegistry.find(route.provider_id, modelId);
     if (!model) {
-      if (notify && ctx.hasUI) {
-        ctx.ui.notify(
-          `${EXT_NOTIFY} No model ${route.provider_id}/${modelId} (${reason})`,
+      if (notify) {
+        notifyDecision(
+          ctx,
           "warning",
+          switchDecisionKind(reason, false),
+          `No model ${route.provider_id}/${modelId} (${reason})`,
+          { reason },
         );
       }
       return false;
@@ -2652,20 +3464,22 @@ export default function (pi: ExtensionAPI): void {
 
     let fit = contextFitForRouteModel(ctx, route, modelId);
     if (!fit.fits) {
-      if (notify && ctx.hasUI) {
-        ctx.ui.notify(
-          `${EXT_NOTIFY} Cannot switch yet to ${routeDisplay(vendor, route)} (${modelId}): ${contextFitSummary(fit)}. Compacting current session first…`,
-          "warning",
-        );
+      const compactingMessage =
+        `Cannot switch yet to ${routeDisplay(vendor, route)} (${modelId}): ${contextFitSummary(fit)}. Compacting current session first…`;
+      if (notify) {
+        notifyDecision(ctx, "info", "compaction", compactingMessage, { reason });
       }
 
       const compactResult = await runSwitchCompaction(ctx, route, modelId);
       if (!compactResult.ok) {
-        if (notify && ctx.hasUI) {
+        if (notify) {
           const reasonText = compactResult.message ? ` Reason: ${compactResult.message}` : "";
-          ctx.ui.notify(
-            `${EXT_NOTIFY} Could not compact session before switching to ${routeDisplay(vendor, route)}.${reasonText}`,
+          notifyDecision(
+            ctx,
             "warning",
+            "compaction",
+            `Could not compact session before switching to ${routeDisplay(vendor, route)}.${reasonText}`,
+            { reason },
           );
         }
         return false;
@@ -2673,19 +3487,25 @@ export default function (pi: ExtensionAPI): void {
 
       fit = contextFitForRouteModel(ctx, route, modelId);
       if (!fit.fits) {
-        if (notify && ctx.hasUI) {
-          ctx.ui.notify(
-            `${EXT_NOTIFY} Still cannot switch to ${routeDisplay(vendor, route)} (${modelId}) after compaction: ${contextFitSummary(fit)}.`,
+        if (notify) {
+          notifyDecision(
+            ctx,
             "warning",
+            "compaction",
+            `Still cannot switch to ${routeDisplay(vendor, route)} (${modelId}) after compaction: ${contextFitSummary(fit)}.`,
+            { reason },
           );
         }
         return false;
       }
 
-      if (notify && ctx.hasUI) {
-        ctx.ui.notify(
-          `${EXT_NOTIFY} Compaction complete. Retrying switch to ${routeDisplay(vendor, route)} (${modelId}).`,
+      if (notify) {
+        notifyDecision(
+          ctx,
           "info",
+          "compaction",
+          `Compaction complete. Retrying switch to ${routeDisplay(vendor, route)} (${modelId}).`,
+          { reason },
         );
       }
     }
@@ -2700,10 +3520,13 @@ export default function (pi: ExtensionAPI): void {
     }
 
     if (!ok) {
-      if (notify && ctx.hasUI) {
-        ctx.ui.notify(
-          `${EXT_NOTIFY} Missing credentials for ${route.provider_id}/${modelId} (${reason})`,
+      if (notify) {
+        notifyDecision(
+          ctx,
           "warning",
+          switchDecisionKind(reason, false),
+          `Missing credentials for ${route.provider_id}/${modelId} (${reason})`,
+          { reason },
         );
       }
       return false;
@@ -2713,10 +3536,13 @@ export default function (pi: ExtensionAPI): void {
     activeRouteIndexByVendor.set(vendor, routeIndex);
     managedModelId = modelId;
 
-    if (notify && ctx.hasUI) {
-      ctx.ui.notify(
-        `${EXT_NOTIFY} Switched to ${routeDisplay(vendor, route)} (${route.provider_id}/${modelId})`,
+    if (notify) {
+      notifyDecision(
+        ctx,
         "info",
+        switchDecisionKind(reason, true),
+        `Switched to ${routeDisplay(vendor, route)} (${route.provider_id}/${modelId})`,
+        { reason },
       );
     }
 
@@ -3492,6 +4318,265 @@ export default function (pi: ExtensionAPI): void {
       }
     }
 
+    function compatibleModelsForVendor(vendor: string): string[] {
+      const v = getVendor(vendor);
+      if (!v) return [];
+
+      const available = (ctx.modelRegistry.getAvailable?.() ?? []) as any[];
+      const byProvider = new Map<string, Set<string>>();
+
+      for (const m of available) {
+        const p = String(m?.provider ?? "");
+        const id = String(m?.id ?? "");
+        if (!p || !id) continue;
+        if (!byProvider.has(p)) byProvider.set(p, new Set<string>());
+        byProvider.get(p)?.add(id);
+      }
+
+      let intersection: Set<string> | undefined;
+      for (const route of v.routes) {
+        const ids = byProvider.get(route.provider_id) ?? new Set<string>();
+        if (!intersection) {
+          intersection = new Set(ids);
+          continue;
+        }
+
+        for (const id of Array.from(intersection)) {
+          if (!ids.has(id)) intersection.delete(id);
+        }
+      }
+
+      return Array.from(intersection ?? []).sort();
+    }
+
+    type SetupValidationResult = {
+      lines: string[];
+      missingOauth: string[];
+      missingApiRoutes: string[];
+      missingApiEnvNames: string[];
+      modelCompatible: boolean;
+      compatibleModels: string[];
+      contextBlocked: ResolvedPreferenceEntry | undefined;
+      contextBlockedCount: number;
+    };
+
+    async function collectSetupValidation(
+      defaultVendor: string,
+    ): Promise<SetupValidationResult> {
+      const lines: string[] = [`${EXT_NOTIFY} setup validation`];
+
+      const currentModelId = String(ctx.model?.id ?? "").trim();
+      const missingOauth = await missingOauthProviders(ctx, configuredOauthProviders());
+
+      const missingApiRoutes: string[] = [];
+      const missingApiEnvNames: string[] = [];
+      for (const v of cfg?.vendors ?? []) {
+        for (const route of v.routes) {
+          if (route.auth_type !== "api_key") continue;
+          const key = resolveApiKey(route);
+          if (key) continue;
+
+          const envName = String(route.api_key_env ?? "").trim();
+          missingApiRoutes.push(
+            `${routeDisplay(v.vendor, route)}${envName ? ` (env ${envName})` : ""}`,
+          );
+          if (envName) missingApiEnvNames.push(envName);
+        }
+      }
+
+      let modelCompatible = false;
+      if (currentModelId) {
+        for (const v of cfg?.vendors ?? []) {
+          for (const route of v.routes) {
+            if (routeCanHandleModel(ctx, route, currentModelId)) {
+              modelCompatible = true;
+              break;
+            }
+          }
+          if (modelCompatible) break;
+        }
+      }
+
+      const compatibleModels = compatibleModelsForVendor(defaultVendor);
+
+      let contextBlocked: ResolvedPreferenceEntry | undefined;
+      let contextBlockedCount = 0;
+      if (currentModelId) {
+        const effective = buildEffectivePreferenceStack(defaultVendor, currentModelId);
+        const selection = findNextEligibleFallback(ctx, effective, 0);
+        contextBlocked = selection.first_context_blocked;
+        contextBlockedCount = selection.context_blocked;
+      }
+
+      if (missingOauth.length > 0) {
+        lines.push(`⚠ OAuth login missing for: ${missingOauth.join(", ")}`);
+      } else {
+        lines.push("✓ OAuth authentication looks good");
+      }
+
+      if (missingApiRoutes.length > 0) {
+        lines.push(`⚠ API key material missing for: ${missingApiRoutes.join("; ")}`);
+      } else {
+        lines.push("✓ API key routes have credentials");
+      }
+
+      if (!currentModelId) {
+        lines.push("⚠ No active model selected; run /model to choose one.");
+      } else if (!modelCompatible) {
+        const hint =
+          compatibleModels.length > 0
+            ? ` Try one of: ${compatibleModels.slice(0, 8).join(", ")}`
+            : " No shared model found across configured routes.";
+        lines.push(`⚠ Current model '${currentModelId}' is not compatible with configured routes.${hint}`);
+      } else {
+        lines.push(`✓ Current model '${currentModelId}' is compatible`);
+      }
+
+      if (contextBlockedCount > 0 && contextBlocked) {
+        lines.push(
+          `ℹ ${contextBlockedCount} preferred fallback route(s) are currently context-blocked (example: ${routeDisplay(contextBlocked.route_ref.vendor, contextBlocked.route_ref.route)} model=${contextBlocked.model_id}).`,
+        );
+      } else {
+        lines.push("✓ No context-window block detected for current preference stack");
+      }
+
+      return {
+        lines,
+        missingOauth,
+        missingApiRoutes,
+        missingApiEnvNames,
+        modelCompatible: Boolean(currentModelId) && modelCompatible,
+        compatibleModels,
+        contextBlocked,
+        contextBlockedCount,
+      };
+    }
+
+    async function trySwitchToCompatibleModel(
+      vendor: string,
+      modelId: string,
+    ): Promise<boolean> {
+      const v = getVendor(vendor);
+      if (!v) return false;
+
+      for (let i = 0; i < v.routes.length; i++) {
+        const route = v.routes[i];
+        if (!routeCanHandleModel(ctx, route, modelId)) continue;
+
+        const ok = await switchToRoute(
+          ctx,
+          vendor,
+          i,
+          modelId,
+          "setup validation model fix",
+          true,
+        );
+        if (ok) return true;
+      }
+
+      return false;
+    }
+
+    async function runSetupValidation(defaultVendor: string): Promise<void> {
+      while (true) {
+        const check = await collectSetupValidation(defaultVendor);
+        const hasHardFailures =
+          check.missingOauth.length > 0 ||
+          check.missingApiRoutes.length > 0 ||
+          !check.modelCompatible;
+
+        ctx.ui.notify(
+          check.lines.join("\n"),
+          hasHardFailures ? "warning" : "info",
+        );
+
+        const options: string[] = ["Done", "Re-run checks"];
+
+        if (check.missingOauth.length > 0) {
+          options.unshift("Run /login now");
+        }
+
+        if (check.missingApiRoutes.length > 0) {
+          options.unshift("Show missing API key env vars");
+        }
+
+        if (!check.modelCompatible && check.compatibleModels.length > 0) {
+          options.unshift(
+            `Try switching to compatible model (${check.compatibleModels[0]})`,
+          );
+        }
+
+        if (check.contextBlocked) {
+          options.unshift("Compact session now");
+        }
+
+        const choice = await ctx.ui.select("Validate setup now", options);
+        if (!choice || choice === "Done") return;
+
+        if (choice === "Run /login now") {
+          await promptOauthLogin(ctx, check.missingOauth);
+          continue;
+        }
+
+        if (choice === "Show missing API key env vars") {
+          const vars = Array.from(new Set(check.missingApiEnvNames)).filter(Boolean);
+          if (vars.length === 0) {
+            ctx.ui.notify(
+              `${EXT_NOTIFY} Missing API key credentials. Check api_key_env/api_key_path/api_key in your config.`,
+              "warning",
+            );
+          } else {
+            ctx.ui.notify(
+              `${EXT_NOTIFY} Set these env vars, then Re-run checks:\n${vars
+                .map((name) => `  - ${name}`)
+                .join("\n")}`,
+              "warning",
+            );
+          }
+          continue;
+        }
+
+        if (choice.startsWith("Try switching to compatible model")) {
+          const modelOptions = check.compatibleModels.slice(0, 20);
+          const pickedModel = await ctx.ui.select("Choose compatible model", [
+            ...modelOptions,
+            "← Back",
+          ]);
+          if (!pickedModel || pickedModel === "← Back") continue;
+
+          const switched = await trySwitchToCompatibleModel(defaultVendor, pickedModel);
+          if (!switched) {
+            ctx.ui.notify(
+              `${EXT_NOTIFY} Could not switch to compatible model '${pickedModel}'.`,
+              "warning",
+            );
+          }
+          continue;
+        }
+
+        if (choice === "Compact session now") {
+          const target = check.contextBlocked;
+          if (!target) continue;
+
+          const compact = await runSwitchCompaction(
+            ctx,
+            target.route_ref.route,
+            target.model_id,
+          );
+          if (!compact.ok) {
+            const reasonText = compact.message ? ` Reason: ${compact.message}` : "";
+            ctx.ui.notify(
+              `${EXT_NOTIFY} Compaction failed.${reasonText}`,
+              "warning",
+            );
+          } else {
+            ctx.ui.notify(`${EXT_NOTIFY} Compaction complete.`, "info");
+          }
+          continue;
+        }
+      }
+    }
+
     let stage: "dest" | "vendors" | "routes" | "order" | "default" | "policy" | "stack" = "dest";
 
     while (true) {
@@ -3758,8 +4843,28 @@ export default function (pi: ExtensionAPI): void {
       ctx.ui.notify(`${EXT_NOTIFY} Wrote config to ${targetPath}`, "info");
 
       const oauthProviders = configuredOauthProviders();
-      if (oauthProviders.length > 0) {
-        await promptOauthLogin(ctx, oauthProviders);
+
+      while (true) {
+        const nextStep = await ctx.ui.select("Setup complete", [
+          "Finish setup",
+          "Validate now",
+          "OAuth login checklist",
+        ]);
+
+        if (!nextStep || nextStep === "Finish setup") {
+          break;
+        }
+
+        if (nextStep === "Validate now") {
+          await runSetupValidation(defaultVendorChoice);
+          continue;
+        }
+
+        if (oauthProviders.length > 0) {
+          await promptOauthLogin(ctx, oauthProviders);
+        } else {
+          ctx.ui.notify(`${EXT_NOTIFY} No OAuth providers configured.`, "info");
+        }
       }
 
       updateStatus(ctx);
@@ -3778,6 +4883,9 @@ export default function (pi: ExtensionAPI): void {
     const options: string[] = [
       "Status",
       "Long status",
+      "Explain routing",
+      "Recent events",
+      "Start continuation fallback",
       "Setup wizard",
       "OAuth login checklist",
       "Edit config",
@@ -3801,6 +4909,31 @@ export default function (pi: ExtensionAPI): void {
 
     if (selected === "Long status") {
       notifyStatus(ctx, true);
+      return;
+    }
+
+    if (selected === "Explain routing") {
+      notifyExplain(ctx);
+      return;
+    }
+
+    if (selected === "Recent events") {
+      notifyEvents(ctx, DECISION_EVENT_DEFAULT_LIMIT);
+      return;
+    }
+
+    if (selected === "Start continuation fallback") {
+      const target = resolveContinuationTarget(ctx);
+      if (!target) {
+        if (ctx.hasUI) {
+          ctx.ui.notify(`${EXT_NOTIFY} Could not resolve continuation target route/model.`, "warning");
+        }
+        return;
+      }
+      const result = await runContinuationFallback(ctx, target);
+      if (!result.ok && ctx.hasUI) {
+        ctx.ui.notify(`${EXT_NOTIFY} ${result.message}`, "warning");
+      }
       return;
     }
 
@@ -3879,15 +5012,18 @@ export default function (pi: ExtensionAPI): void {
     name: "subswitch_manage",
     label: "Subswitch Manage",
     description:
-      "Manage subscription/api failover routes for vendors (openai/claude). Supports status/longstatus, use, prefer, rename, reload.",
+      "Manage subscription/api failover routes for vendors (openai/claude). Supports status/longstatus/explain/events, use, prefer, rename, reload, continue.",
     parameters: Type.Object({
       action: Type.Union([
         Type.Literal("status"),
         Type.Literal("longstatus"),
+        Type.Literal("explain"),
+        Type.Literal("events"),
         Type.Literal("use"),
         Type.Literal("prefer"),
         Type.Literal("rename"),
         Type.Literal("reload"),
+        Type.Literal("continue"),
       ]),
       vendor: Type.Optional(Type.String({ description: "Vendor, e.g. openai or claude" })),
       auth_type: Type.Optional(
@@ -3897,6 +5033,7 @@ export default function (pi: ExtensionAPI): void {
       ),
       label: Type.Optional(Type.String({ description: "Route label, e.g. work/personal" })),
       model_id: Type.Optional(Type.String({ description: "Optional model id to switch to while applying route" })),
+      limit: Type.Optional(Type.Number({ description: "Optional limit for action=events" })),
       old_label: Type.Optional(Type.String({ description: "Old label for rename action" })),
       new_label: Type.Optional(Type.String({ description: "New label for rename action" })),
     }),
@@ -3919,6 +5056,26 @@ export default function (pi: ExtensionAPI): void {
         return {
           content: [{ type: "text", text }],
           details: { action, ok: true },
+        };
+      }
+
+      if (action === "explain") {
+        const text = buildExplainLines(ctx).join("\n");
+        return {
+          content: [{ type: "text", text }],
+          details: { action, ok: true },
+        };
+      }
+
+      if (action === "events") {
+        const nRaw = Number(params.limit ?? DECISION_EVENT_DEFAULT_LIMIT);
+        const limit = Number.isFinite(nRaw)
+          ? Math.max(1, Math.min(200, Math.floor(nRaw)))
+          : DECISION_EVENT_DEFAULT_LIMIT;
+        const text = buildDecisionEventLines(limit).join("\n");
+        return {
+          content: [{ type: "text", text }],
+          details: { action, ok: true, limit },
         };
       }
 
@@ -3992,6 +5149,47 @@ export default function (pi: ExtensionAPI): void {
         };
       }
 
+      if (action === "continue") {
+        const vendor = params.vendor ? String(params.vendor).trim().toLowerCase() : undefined;
+        const authType = params.auth_type
+          ? (String(params.auth_type).trim() as AuthType)
+          : undefined;
+        const label = params.label ? String(params.label).trim() : undefined;
+        const modelId = params.model_id ? String(params.model_id).trim() : undefined;
+
+        const hasExplicitSelector = Boolean(vendor || authType || label || modelId);
+        if (hasExplicitSelector && !(vendor && authType && label)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Usage for action=continue: provide vendor+auth_type+label together (model_id optional), or provide none to auto-select target.",
+              },
+            ],
+            details: { action, ok: false },
+          };
+        }
+
+        const target = resolveContinuationTarget(ctx, vendor, authType, label, modelId);
+        if (!target) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Could not resolve continuation target route/model.",
+              },
+            ],
+            details: { action, ok: false },
+          };
+        }
+
+        const result = await runContinuationFallback(ctx, target);
+        return {
+          content: [{ type: "text", text: result.message }],
+          details: { action, ok: result.ok },
+        };
+      }
+
       if (action === "rename") {
         const vendor = String(params.vendor ?? "").trim().toLowerCase();
         const authType = String(params.auth_type ?? "").trim() as AuthType;
@@ -4045,7 +5243,7 @@ export default function (pi: ExtensionAPI): void {
         content: [
           {
             type: "text",
-            text: `Unknown action '${action}'. Supported: status, longstatus, use, prefer, rename, reload.`,
+            text: `Unknown action '${action}'. Supported: status, longstatus, explain, events, use, prefer, rename, reload, continue.`,
           },
         ],
         details: { action, ok: false },
@@ -4065,11 +5263,25 @@ export default function (pi: ExtensionAPI): void {
       const parts = splitArgs(args || "");
       const cmd = parts[0] ?? "";
 
-      if (cmd === "" || cmd === "status" || cmd === "longstatus") {
+      if (
+        cmd === "" ||
+        cmd === "status" ||
+        cmd === "longstatus" ||
+        cmd === "explain" ||
+        cmd === "events"
+      ) {
         if (cmd === "") {
           await runQuickPicker(ctx);
-        } else {
+        } else if (cmd === "status" || cmd === "longstatus") {
           notifyStatus(ctx, cmd === "longstatus");
+        } else if (cmd === "explain") {
+          notifyExplain(ctx);
+        } else {
+          const nRaw = Number(parts[1] ?? DECISION_EVENT_DEFAULT_LIMIT);
+          const limit = Number.isFinite(nRaw)
+            ? Math.max(1, Math.min(200, Math.floor(nRaw)))
+            : DECISION_EVENT_DEFAULT_LIMIT;
+          notifyEvents(ctx, limit);
         }
         await refreshOauthReminderWidget(ctx, configuredOauthProviders());
         updateStatus(ctx);
@@ -4084,6 +5296,8 @@ export default function (pi: ExtensionAPI): void {
             "  (no args)                     Quick picker + status\n" +
             "  status                        Show concise status\n" +
             "  longstatus                    Show detailed status (stack/models/ids)\n" +
+            "  explain                       Explain current route selection and ineligible candidates\n" +
+            "  events [limit]                Show recent route decision events\n" +
             "  setup                         Guided setup wizard (applies only on finish)\n" +
             "  login                         Prompt OAuth login checklist and prefill /login\n" +
             "  login-status                  Re-check OAuth login completion and update reminder\n" +
@@ -4092,6 +5306,8 @@ export default function (pi: ExtensionAPI): void {
             "  reorder [vendor]              Interactive reorder for failover preference stack\n" +
             "  edit                          Edit JSON config with validation\n" +
             "  models <vendor>               Show compatible models across routes\n" +
+            "  continue [vendor auth_type label [modelId]]\n" +
+            "                                Create reduced-carryover continuation session\n" +
             "  use <vendor> <auth_type> <label> [modelId]\n" +
             "  subscription <vendor> [label] [modelId]\n" +
             "  api <vendor> [label] [modelId]\n" +
@@ -4275,6 +5491,56 @@ export default function (pi: ExtensionAPI): void {
         return;
       }
 
+      if (cmd === "continue") {
+        const vendor = parts[1] ? String(parts[1]).trim().toLowerCase() : undefined;
+        const authType = parts[2] ? (String(parts[2]).trim() as AuthType) : undefined;
+        const label = parts[3] ? String(parts[3]).trim() : undefined;
+        const modelId = parts[4] ? String(parts[4]).trim() : undefined;
+
+        if (authType && authType !== "oauth" && authType !== "api_key") {
+          if (ctx.hasUI) {
+            ctx.ui.notify(
+              `${EXT_NOTIFY} Usage: /subswitch continue [vendor auth_type(oauth|api_key) label [modelId]]`,
+              "warning",
+            );
+          }
+          updateStatus(ctx);
+          return;
+        }
+
+        const hasExplicitSelector = Boolean(vendor || authType || label || modelId);
+        if (hasExplicitSelector && !(vendor && authType && label)) {
+          if (ctx.hasUI) {
+            ctx.ui.notify(
+              `${EXT_NOTIFY} Usage: /subswitch continue [vendor auth_type(oauth|api_key) label [modelId]]`,
+              "warning",
+            );
+          }
+          updateStatus(ctx);
+          return;
+        }
+
+        const target = resolveContinuationTarget(ctx, vendor, authType, label, modelId);
+        if (!target) {
+          if (ctx.hasUI) {
+            ctx.ui.notify(
+              `${EXT_NOTIFY} Could not resolve continuation target route/model.`,
+              "warning",
+            );
+          }
+          updateStatus(ctx);
+          return;
+        }
+
+        const result = await runContinuationFallback(ctx, target);
+        if (!result.ok && ctx.hasUI) {
+          ctx.ui.notify(`${EXT_NOTIFY} ${result.message}`, "warning");
+        }
+
+        updateStatus(ctx);
+        return;
+      }
+
       if (ctx.hasUI) {
         ctx.ui.notify(`${EXT_NOTIFY} Unknown command '${cmd}'. Try '/subswitch help'.`, "warning");
       }
@@ -4391,25 +5657,41 @@ export default function (pi: ExtensionAPI): void {
         ? "quota exhausted"
         : "rate limited";
 
+    notifyDecision(
+      ctx,
+      triggeredByAuth ? "warning" : "info",
+      "failover_trigger",
+      `${routeDisplay(resolved.vendor, route)} hit ${triggerLabel}. Evaluating fallback routes.`,
+      {
+        reason: String(err),
+        nextRetryAtMs: until,
+        silent: true,
+      },
+    );
+
     let selection = findNextEligibleFallback(ctx, effective, start);
     let nextEntry = selection.entry;
 
     if (!nextEntry && selection.context_blocked > 0) {
-      if (ctx.hasUI) {
-        ctx.ui.notify(
-          `${EXT_NOTIFY} ${selection.context_blocked} fallback route(s) are currently blocked by context size. Trying compaction before failover…`,
-          "warning",
-        );
-      }
+      notifyDecision(
+        ctx,
+        "info",
+        "compaction",
+        `${selection.context_blocked} fallback route(s) are currently blocked by context size. Trying compaction before failover…`,
+        { reason: triggerLabel },
+      );
 
       const compactTargetRoute = selection.first_context_blocked?.route_ref.route ?? route;
       const compactTargetModel = selection.first_context_blocked?.model_id ?? modelId;
       const compactResult = await runSwitchCompaction(ctx, compactTargetRoute, compactTargetModel);
-      if (!compactResult.ok && ctx.hasUI) {
+      if (!compactResult.ok) {
         const reasonText = compactResult.message ? ` Reason: ${compactResult.message}` : "";
-        ctx.ui.notify(
-          `${EXT_NOTIFY} Could not compact session before fallback retry.${reasonText}`,
+        notifyDecision(
+          ctx,
           "warning",
+          "compaction",
+          `Could not compact session before fallback retry.${reasonText}`,
+          { reason: triggerLabel },
         );
       }
 
@@ -4418,26 +5700,31 @@ export default function (pi: ExtensionAPI): void {
     }
 
     if (!nextEntry) {
-      if (ctx.hasUI) {
-        const contextHint = selection.context_blocked > 0
-          ? ` ${selection.context_blocked} route(s) are blocked by context size.`
-          : "";
-        ctx.ui.notify(
-          `${EXT_NOTIFY} ${routeDisplay(resolved.vendor, route)} hit ${triggerLabel}. No eligible fallback route.${contextHint} Next retry in ${formatRetryWindow(until)}.`,
-          "warning",
-        );
-      }
+      const contextHint = selection.context_blocked > 0
+        ? ` ${selection.context_blocked} route(s) are blocked by context size.`
+        : "";
+      notifyDecision(
+        ctx,
+        "warning",
+        "no_fallback",
+        `${routeDisplay(resolved.vendor, route)} hit ${triggerLabel}. No eligible fallback route.${contextHint} Next retry in ${formatRetryWindow(until)}.`,
+        {
+          reason: triggerLabel,
+          nextRetryAtMs: until,
+        },
+      );
       scheduleRetryTimer(ctx);
       updateStatus(ctx);
       return;
     }
 
-    if (ctx.hasUI) {
-      ctx.ui.notify(
-        `${EXT_NOTIFY} ${routeDisplay(resolved.vendor, route)} hit ${triggerLabel}. Switching to ${routeDisplay(nextEntry.route_ref.vendor, nextEntry.route_ref.route)} (${nextEntry.model_id}).`,
-        "warning",
-      );
-    }
+    notifyDecision(
+      ctx,
+      "info",
+      "failover_switch",
+      `${routeDisplay(resolved.vendor, route)} hit ${triggerLabel}. Switching to ${routeDisplay(nextEntry.route_ref.vendor, nextEntry.route_ref.route)} (${nextEntry.model_id}).`,
+      { reason: triggerLabel },
+    );
 
     const switched = await switchToRoute(
       ctx,
@@ -4449,12 +5736,16 @@ export default function (pi: ExtensionAPI): void {
     );
 
     if (!switched) {
-      if (ctx.hasUI) {
-        ctx.ui.notify(
-          `${EXT_NOTIFY} Could not switch to fallback route. Staying on ${routeDisplay(resolved.vendor, route)}. Next retry in ${formatRetryWindow(until)}.`,
-          "warning",
-        );
-      }
+      notifyDecision(
+        ctx,
+        "warning",
+        "failover_stay",
+        `Could not switch to fallback route. Staying on ${routeDisplay(resolved.vendor, route)}. Next retry in ${formatRetryWindow(until)}.`,
+        {
+          reason: triggerLabel,
+          nextRetryAtMs: until,
+        },
+      );
       scheduleRetryTimer(ctx);
       updateStatus(ctx);
       return;
@@ -4472,9 +5763,13 @@ export default function (pi: ExtensionAPI): void {
           ? lastPrompt.text
           : [{ type: "text", text: lastPrompt.text }, ...lastPrompt.images];
 
-      if (ctx.hasUI) {
-        ctx.ui.notify(`${EXT_NOTIFY} Retrying your last prompt on the new route…`, "info");
-      }
+      notifyDecision(
+        ctx,
+        "info",
+        "auto_retry",
+        "Retrying your last prompt on the new route…",
+        { reason: triggerLabel },
+      );
 
       if (typeof ctx.isIdle === "function" && ctx.isIdle()) {
         pi.sendUserMessage(content);
