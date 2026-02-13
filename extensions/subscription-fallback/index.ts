@@ -26,6 +26,8 @@ type AuthType = "oauth" | "api_key";
 type FailoverScope = "global" | "current_vendor";
 
 const EXT = "subscription-fallback";
+const EXT_LABEL = "subswitch";
+const EXT_NOTIFY = `[${EXT_LABEL}]`;
 
 interface PreferenceStackEntryConfig {
   route_id?: string;
@@ -246,7 +248,7 @@ function readJson(path: string): any | undefined {
   try {
     return JSON.parse(readFileSync(path, "utf-8"));
   } catch (e) {
-    console.error(`[${EXT}] Failed to parse ${path}:`, e);
+    console.error(`${EXT_NOTIFY} Failed to parse ${path}:`, e);
     return undefined;
   }
 }
@@ -1772,7 +1774,7 @@ export default function (pi: ExtensionAPI): void {
 
     if (ctx.hasUI) {
       ctx.ui.notify(
-        `[${EXT}] Checking whether preferred route is healthy: ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})…`,
+        `${EXT_NOTIFY} Checking whether preferred route is healthy: ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})…`,
         "info",
       );
     }
@@ -1783,7 +1785,7 @@ export default function (pi: ExtensionAPI): void {
         if (ctx.hasUI) {
           const detail = probe.message ? ` (${probe.message})` : "";
           ctx.ui.notify(
-            `[${EXT}] Preferred route check was inconclusive${detail}. Trying a direct switch to ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})…`,
+            `${EXT_NOTIFY} Preferred route check was inconclusive${detail}. Trying a direct switch to ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})…`,
             "info",
           );
         }
@@ -1799,7 +1801,7 @@ export default function (pi: ExtensionAPI): void {
         if (switchedAfterInconclusiveProbe) {
           if (ctx.hasUI) {
             ctx.ui.notify(
-              `[${EXT}] Switched back to preferred route: ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id}).`,
+              `${EXT_NOTIFY} Successfully switched back to preferred route: ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id}).`,
               "info",
             );
           }
@@ -1819,13 +1821,13 @@ export default function (pi: ExtensionAPI): void {
         if (probe.inconclusive) {
           const reasonText = probe.message ? ` Last check: ${probe.message}.` : "";
           ctx.ui.notify(
-            `[${EXT}] Stayed on ${routeDisplay(resolved.vendor, currentRoute)} for now. Preferred route check was inconclusive and direct switch did not succeed. Next check in ${formatRetryWindow(cooldownUntil)}.${reasonText}`,
+            `${EXT_NOTIFY} Stayed on ${routeDisplay(resolved.vendor, currentRoute)} for now. Preferred route check was inconclusive and direct switch did not succeed. Next check in ${formatRetryWindow(cooldownUntil)}.${reasonText}`,
             "info",
           );
         } else {
           const reasonText = probe.message ? ` Reason: ${probe.message}` : "";
           ctx.ui.notify(
-            `[${EXT}] Preferred route still unavailable. Staying on ${routeDisplay(resolved.vendor, currentRoute)}. Next check in ${formatRetryWindow(cooldownUntil)}.${reasonText}`,
+            `${EXT_NOTIFY} Preferred route still unavailable. Staying on ${routeDisplay(resolved.vendor, currentRoute)}. Next check in ${formatRetryWindow(cooldownUntil)}.${reasonText}`,
             "warning",
           );
         }
@@ -1842,7 +1844,7 @@ export default function (pi: ExtensionAPI): void {
 
     if (ctx.hasUI) {
       ctx.ui.notify(
-        `[${EXT}] Preferred route is healthy again. Switching to ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id}).`,
+        `${EXT_NOTIFY} Preferred route is healthy again. Switching to ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id}).`,
         "info",
       );
     }
@@ -1858,7 +1860,7 @@ export default function (pi: ExtensionAPI): void {
 
     if (!switched && ctx.hasUI) {
       ctx.ui.notify(
-        `[${EXT}] Preferred route looks healthy, but switching failed. Staying on ${routeDisplay(resolved.vendor, currentRoute)}.`,
+        `${EXT_NOTIFY} Preferred route looks healthy, but switching failed. Staying on ${routeDisplay(resolved.vendor, currentRoute)}.`,
         "warning",
       );
     }
@@ -2109,13 +2111,13 @@ export default function (pi: ExtensionAPI): void {
 
     const resolved = resolveVendorRouteForProvider(provider);
     if (!resolved) {
-      ctx.ui.setStatus(EXT, ctx.ui.theme.fg("muted", `${EXT}:`) + " " + provider + "/" + modelId);
+      ctx.ui.setStatus(EXT, ctx.ui.theme.fg("muted", `${EXT_LABEL}:`) + " " + provider + "/" + modelId);
       return;
     }
 
     const route = getRoute(resolved.vendor, resolved.index);
     if (!route) {
-      ctx.ui.setStatus(EXT, ctx.ui.theme.fg("muted", `${EXT}:`) + " " + provider + "/" + modelId);
+      ctx.ui.setStatus(EXT, ctx.ui.theme.fg("muted", `${EXT_LABEL}:`) + " " + provider + "/" + modelId);
       return;
     }
 
@@ -2141,7 +2143,7 @@ export default function (pi: ExtensionAPI): void {
       stateDisplay = ctx.ui.theme.fg("error", stateText);
     }
 
-    let msg = ctx.ui.theme.fg("muted", `${EXT}:`);
+    let msg = ctx.ui.theme.fg("muted", `${EXT_LABEL}:`);
     msg += " " + ctx.ui.theme.fg(route.auth_type === "oauth" ? "accent" : "warning", route.auth_type === "oauth" ? "sub" : "api");
     msg += " " + ctx.ui.theme.fg("dim", `${resolved.vendor}/${route.label}`);
     msg += " " + ctx.ui.theme.fg("dim", modelId);
@@ -2198,7 +2200,7 @@ export default function (pi: ExtensionAPI): void {
       : undefined;
 
     if (detailed) {
-      lines.push(`[${EXT}] enabled=${cfg.enabled} default_vendor=${cfg.default_vendor}`);
+      lines.push(`${EXT_NOTIFY} enabled=${cfg.enabled} default_vendor=${cfg.default_vendor}`);
       lines.push(
         `failover scope=${cfg.failover.scope} return_to_preferred=${cfg.failover.return_to_preferred.enabled} stable=${cfg.failover.return_to_preferred.min_stable_minutes}m triggers(rate_limit=${cfg.failover.triggers.rate_limit},quota=${cfg.failover.triggers.quota_exhausted},auth=${cfg.failover.triggers.auth_error})`,
       );
@@ -2362,7 +2364,7 @@ export default function (pi: ExtensionAPI): void {
     const missing = await refreshOauthReminderWidget(ctx, providers);
     if (missing.length === 0) {
       if (ctx.hasUI) {
-        ctx.ui.notify(`[${EXT}] OAuth providers already authenticated`, "info");
+        ctx.ui.notify(`${EXT_NOTIFY} OAuth providers already authenticated`, "info");
       }
       return;
     }
@@ -2377,12 +2379,12 @@ export default function (pi: ExtensionAPI): void {
     if (choice === "Start /login now") {
       ctx.ui.setEditorText("/login");
       ctx.ui.notify(
-        `[${EXT}] Prefilled /login. After each login, run /subswitch login-status.`,
+        `${EXT_NOTIFY} Prefilled /login. After each login, run /subswitch login-status.`,
         "warning",
       );
     } else {
       ctx.ui.notify(
-        `[${EXT}] Reminder saved. Run /subswitch login to resume OAuth login flow.`,
+        `${EXT_NOTIFY} Reminder saved. Run /subswitch login to resume OAuth login flow.`,
         "info",
       );
     }
@@ -2405,7 +2407,7 @@ export default function (pi: ExtensionAPI): void {
     if (!routeCanHandleModel(ctx, route, modelId)) {
       if (notify && ctx.hasUI) {
         ctx.ui.notify(
-          `[${EXT}] Route cannot serve model ${modelId}: ${routeDisplay(vendor, route)}`,
+          `${EXT_NOTIFY} Route cannot serve model ${modelId}: ${routeDisplay(vendor, route)}`,
           "warning",
         );
       }
@@ -2417,7 +2419,7 @@ export default function (pi: ExtensionAPI): void {
       if (!ok) {
         if (notify && ctx.hasUI) {
           ctx.ui.notify(
-            `[${EXT}] Missing API key material for ${routeDisplay(vendor, route)} (check api_key_env/api_key_path/api_key)`,
+            `${EXT_NOTIFY} Missing API key material for ${routeDisplay(vendor, route)} (check api_key_env/api_key_path/api_key)`,
             "warning",
           );
         }
@@ -2429,7 +2431,7 @@ export default function (pi: ExtensionAPI): void {
     if (!model) {
       if (notify && ctx.hasUI) {
         ctx.ui.notify(
-          `[${EXT}] No model ${route.provider_id}/${modelId} (${reason})`,
+          `${EXT_NOTIFY} No model ${route.provider_id}/${modelId} (${reason})`,
           "warning",
         );
       }
@@ -2448,7 +2450,7 @@ export default function (pi: ExtensionAPI): void {
     if (!ok) {
       if (notify && ctx.hasUI) {
         ctx.ui.notify(
-          `[${EXT}] Missing credentials for ${route.provider_id}/${modelId} (${reason})`,
+          `${EXT_NOTIFY} Missing credentials for ${route.provider_id}/${modelId} (${reason})`,
           "warning",
         );
       }
@@ -2461,7 +2463,7 @@ export default function (pi: ExtensionAPI): void {
 
     if (notify && ctx.hasUI) {
       ctx.ui.notify(
-        `[${EXT}] Switched to ${routeDisplay(vendor, route)} (${route.provider_id}/${modelId})`,
+        `${EXT_NOTIFY} Switched to ${routeDisplay(vendor, route)} (${route.provider_id}/${modelId})`,
         "info",
       );
     }
@@ -2483,7 +2485,7 @@ export default function (pi: ExtensionAPI): void {
 
     const v = getVendor(vendor);
     if (!v) {
-      if (ctx.hasUI) ctx.ui.notify(`[${EXT}] Unknown vendor '${vendor}'`, "warning");
+      if (ctx.hasUI) ctx.ui.notify(`${EXT_NOTIFY} Unknown vendor '${vendor}'`, "warning");
       return false;
     }
 
@@ -2491,7 +2493,7 @@ export default function (pi: ExtensionAPI): void {
     if (idx === undefined) {
       if (ctx.hasUI) {
         ctx.ui.notify(
-          `[${EXT}] No route '${label}' with auth_type='${authType}' for vendor '${vendor}'`,
+          `${EXT_NOTIFY} No route '${label}' with auth_type='${authType}' for vendor '${vendor}'`,
           "warning",
         );
       }
@@ -2501,7 +2503,7 @@ export default function (pi: ExtensionAPI): void {
     const targetModelId = modelId ?? ctx.model?.id;
     if (!targetModelId) {
       if (ctx.hasUI) {
-        ctx.ui.notify(`[${EXT}] No current model selected; specify model id explicitly`, "warning");
+        ctx.ui.notify(`${EXT_NOTIFY} No current model selected; specify model id explicitly`, "warning");
       }
       return false;
     }
@@ -2521,14 +2523,14 @@ export default function (pi: ExtensionAPI): void {
 
     const v = getVendor(vendor);
     if (!v) {
-      if (ctx.hasUI) ctx.ui.notify(`[${EXT}] Unknown vendor '${vendor}'`, "warning");
+      if (ctx.hasUI) ctx.ui.notify(`${EXT_NOTIFY} Unknown vendor '${vendor}'`, "warning");
       return false;
     }
 
     const targetModelId = modelId ?? ctx.model?.id;
     if (!targetModelId) {
       if (ctx.hasUI) {
-        ctx.ui.notify(`[${EXT}] No current model selected; specify model id explicitly`, "warning");
+        ctx.ui.notify(`${EXT_NOTIFY} No current model selected; specify model id explicitly`, "warning");
       }
       return false;
     }
@@ -2540,7 +2542,7 @@ export default function (pi: ExtensionAPI): void {
       if (idx === undefined) {
         if (ctx.hasUI) {
           ctx.ui.notify(
-            `[${EXT}] No ${authType} route '${label}' for vendor '${vendor}'`,
+            `${EXT_NOTIFY} No ${authType} route '${label}' for vendor '${vendor}'`,
             "warning",
           );
         }
@@ -2558,7 +2560,7 @@ export default function (pi: ExtensionAPI): void {
       if (idx === undefined) {
         if (ctx.hasUI) {
           ctx.ui.notify(
-            `[${EXT}] No eligible ${authType} route for vendor '${vendor}' and model '${targetModelId}'`,
+            `${EXT_NOTIFY} No eligible ${authType} route for vendor '${vendor}' and model '${targetModelId}'`,
             "warning",
           );
         }
@@ -2634,7 +2636,7 @@ export default function (pi: ExtensionAPI): void {
 
     const v = getVendor(vendor);
     if (!v) {
-      if (ctx.hasUI) ctx.ui.notify(`[${EXT}] Unknown vendor '${vendor}'`, "warning");
+      if (ctx.hasUI) ctx.ui.notify(`${EXT_NOTIFY} Unknown vendor '${vendor}'`, "warning");
       return;
     }
 
@@ -2665,7 +2667,7 @@ export default function (pi: ExtensionAPI): void {
 
     if (ctx.hasUI) {
       ctx.ui.notify(
-        `[${EXT}] Compatible models for vendor '${vendor}' across ${v.routes.length} routes: ${
+        `${EXT_NOTIFY} Compatible models for vendor '${vendor}' across ${v.routes.length} routes: ${
           models.length > 0 ? models.join(", ") : "(none)"
         }`,
         models.length > 0 ? "info" : "warning",
@@ -2688,7 +2690,7 @@ export default function (pi: ExtensionAPI): void {
 
     if (indexed.length < 2) {
       const scope = filterVendor ? `for vendor '${filterVendor}'` : "";
-      ctx.ui.notify(`[${EXT}] Need at least 2 stack entries ${scope} to reorder`, "warning");
+      ctx.ui.notify(`${EXT_NOTIFY} Need at least 2 stack entries ${scope} to reorder`, "warning");
       return;
     }
 
@@ -2718,7 +2720,7 @@ export default function (pi: ExtensionAPI): void {
 
     const savePath = saveCurrentConfig(ctx);
     ctx.ui.notify(
-      `[${EXT}] Reordered preference stack${filterVendor ? ` for '${filterVendor}'` : ""}. Saved to ${savePath}`,
+      `${EXT_NOTIFY} Reordered preference stack${filterVendor ? ` for '${filterVendor}'` : ""}. Saved to ${savePath}`,
       "info",
     );
 
@@ -2746,13 +2748,13 @@ export default function (pi: ExtensionAPI): void {
     try {
       parsed = JSON.parse(edited) as Config;
     } catch (e) {
-      ctx.ui.notify(`[${EXT}] Invalid JSON: ${String(e)}`, "error");
+      ctx.ui.notify(`${EXT_NOTIFY} Invalid JSON: ${String(e)}`, "error");
       return;
     }
 
     const normalized = normalizeConfig(parsed);
     if (normalized.vendors.length === 0) {
-      ctx.ui.notify(`[${EXT}] Config must define at least one vendor with routes`, "error");
+      ctx.ui.notify(`${EXT_NOTIFY} Config must define at least one vendor with routes`, "error");
       return;
     }
 
@@ -2760,7 +2762,7 @@ export default function (pi: ExtensionAPI): void {
     cfg = normalized;
     registerAliasesFromConfig(cfg);
 
-    ctx.ui.notify(`[${EXT}] Saved config to ${path}`, "info");
+    ctx.ui.notify(`${EXT_NOTIFY} Saved config to ${path}`, "info");
     updateStatus(ctx);
   }
 
@@ -2789,9 +2791,9 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
-    ctx.ui.notify(`[${EXT}] Starting setup wizard…`, "info");
+    ctx.ui.notify(`${EXT_NOTIFY} Starting setup wizard…`, "info");
     ctx.ui.notify(
-      `[${EXT}] Changes are applied only when you finish setup. Cancel keeps current config.`,
+      `${EXT_NOTIFY} Changes are applied only when you finish setup. Cancel keeps current config.`,
       "info",
     );
 
@@ -3168,7 +3170,7 @@ export default function (pi: ExtensionAPI): void {
 
         if (choice === "Move entry") {
           if (entryOptions.length < 2) {
-            ctx.ui.notify(`[${EXT}] Need at least 2 entries to reorder`, "warning");
+            ctx.ui.notify(`${EXT_NOTIFY} Need at least 2 entries to reorder`, "warning");
             continue;
           }
 
@@ -3252,7 +3254,7 @@ export default function (pi: ExtensionAPI): void {
         );
 
         if (!destChoice || destChoice === "Cancel") {
-          ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+          ctx.ui.notify(`${EXT_NOTIFY} Setup cancelled`, "warning");
           return;
         }
 
@@ -3274,7 +3276,7 @@ export default function (pi: ExtensionAPI): void {
         ]);
 
         if (!choice || choice === "Cancel") {
-          ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+          ctx.ui.notify(`${EXT_NOTIFY} Setup cancelled`, "warning");
           return;
         }
 
@@ -3296,7 +3298,7 @@ export default function (pi: ExtensionAPI): void {
         }
 
         if (!useOpenAI && !useClaude) {
-          ctx.ui.notify(`[${EXT}] Select at least one vendor`, "warning");
+          ctx.ui.notify(`${EXT_NOTIFY} Select at least one vendor`, "warning");
           continue;
         }
 
@@ -3308,7 +3310,7 @@ export default function (pi: ExtensionAPI): void {
         if (useOpenAI) {
           const openaiResult = await collectVendor("openai", vendorConfigs.get("openai"));
           if (openaiResult.nav === "cancel") {
-            ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+            ctx.ui.notify(`${EXT_NOTIFY} Setup cancelled`, "warning");
             return;
           }
           if (openaiResult.nav === "back") {
@@ -3322,7 +3324,7 @@ export default function (pi: ExtensionAPI): void {
         if (useClaude) {
           const claudeResult = await collectVendor("claude", vendorConfigs.get("claude"));
           if (claudeResult.nav === "cancel") {
-            ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+            ctx.ui.notify(`${EXT_NOTIFY} Setup cancelled`, "warning");
             return;
           }
           if (claudeResult.nav === "back") {
@@ -3334,7 +3336,7 @@ export default function (pi: ExtensionAPI): void {
         }
 
         if (vendorConfigs.size === 0) {
-          ctx.ui.notify(`[${EXT}] No routes configured; returning to vendor selection`, "warning");
+          ctx.ui.notify(`${EXT_NOTIFY} No routes configured; returning to vendor selection`, "warning");
           stage = "vendors";
           continue;
         }
@@ -3347,7 +3349,7 @@ export default function (pi: ExtensionAPI): void {
         if (useOpenAI && vendorConfigs.has("openai")) {
           const nav = await orderVendorRoutes("openai");
           if (nav === "cancel") {
-            ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+            ctx.ui.notify(`${EXT_NOTIFY} Setup cancelled`, "warning");
             return;
           }
           if (nav === "back") {
@@ -3359,7 +3361,7 @@ export default function (pi: ExtensionAPI): void {
         if (useClaude && vendorConfigs.has("claude")) {
           const nav = await orderVendorRoutes("claude");
           if (nav === "cancel") {
-            ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+            ctx.ui.notify(`${EXT_NOTIFY} Setup cancelled`, "warning");
             return;
           }
           if (nav === "back") {
@@ -3395,7 +3397,7 @@ export default function (pi: ExtensionAPI): void {
         ]);
 
         if (!defaultChoice || defaultChoice === "Cancel") {
-          ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+          ctx.ui.notify(`${EXT_NOTIFY} Setup cancelled`, "warning");
           return;
         }
 
@@ -3423,7 +3425,7 @@ export default function (pi: ExtensionAPI): void {
         ]);
 
         if (!policyChoice || policyChoice === "Cancel") {
-          ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+          ctx.ui.notify(`${EXT_NOTIFY} Setup cancelled`, "warning");
           return;
         }
 
@@ -3448,14 +3450,14 @@ export default function (pi: ExtensionAPI): void {
             String(returnStableMinutes),
           );
           if (minutesRes.nav === "cancel") {
-            ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+            ctx.ui.notify(`${EXT_NOTIFY} Setup cancelled`, "warning");
             return;
           }
           if (minutesRes.nav === "back") continue;
 
           const parsed = Number(String(minutesRes.value ?? "").trim());
           if (!Number.isFinite(parsed) || parsed < 0) {
-            ctx.ui.notify(`[${EXT}] Enter a non-negative integer`, "warning");
+            ctx.ui.notify(`${EXT_NOTIFY} Enter a non-negative integer`, "warning");
             continue;
           }
           returnStableMinutes = Math.floor(parsed);
@@ -3483,7 +3485,7 @@ export default function (pi: ExtensionAPI): void {
 
       const nav = await configurePreferenceStack(defaultVendorChoice);
       if (nav === "cancel") {
-        ctx.ui.notify(`[${EXT}] Setup cancelled`, "warning");
+        ctx.ui.notify(`${EXT_NOTIFY} Setup cancelled`, "warning");
         return;
       }
       if (nav === "back") {
@@ -3501,7 +3503,7 @@ export default function (pi: ExtensionAPI): void {
       pruneRuntimeState();
       persistRuntimeState();
 
-      ctx.ui.notify(`[${EXT}] Wrote config to ${targetPath}`, "info");
+      ctx.ui.notify(`${EXT_NOTIFY} Wrote config to ${targetPath}`, "info");
 
       const oauthProviders = configuredOauthProviders();
       if (oauthProviders.length > 0) {
@@ -3868,10 +3870,10 @@ export default function (pi: ExtensionAPI): void {
         const missing = await refreshOauthReminderWidget(ctx, providers);
         if (ctx.hasUI) {
           if (missing.length === 0) {
-            ctx.ui.notify(`[${EXT}] OAuth login checklist complete`, "info");
+            ctx.ui.notify(`${EXT_NOTIFY} OAuth login checklist complete`, "info");
           } else {
             ctx.ui.notify(
-              `[${EXT}] Missing OAuth login for: ${missing.join(", ")}`,
+              `${EXT_NOTIFY} Missing OAuth login for: ${missing.join(", ")}`,
               "warning",
             );
           }
@@ -3890,7 +3892,7 @@ export default function (pi: ExtensionAPI): void {
 
       if (cmd === "on") {
         if (cfg) cfg.enabled = true;
-        if (ctx.hasUI) ctx.ui.notify(`[${EXT}] enabled=true (runtime)`, "info");
+        if (ctx.hasUI) ctx.ui.notify(`${EXT_NOTIFY} enabled=true (runtime)`, "info");
         updateStatus(ctx);
         return;
       }
@@ -3901,7 +3903,7 @@ export default function (pi: ExtensionAPI): void {
         restoreOriginalEnv();
         pendingOauthReminderProviders = [];
         if (ctx.hasUI) {
-          ctx.ui.notify(`[${EXT}] enabled=false (runtime)`, "warning");
+          ctx.ui.notify(`${EXT_NOTIFY} enabled=false (runtime)`, "warning");
           ctx.ui.setStatus(EXT, undefined);
           ctx.ui.setWidget(LOGIN_WIDGET_KEY, undefined);
         }
@@ -3917,7 +3919,7 @@ export default function (pi: ExtensionAPI): void {
         if (!vendor || (authType !== "oauth" && authType !== "api_key") || !label) {
           if (ctx.hasUI) {
             ctx.ui.notify(
-              `[${EXT}] Usage: /subswitch use <vendor> <auth_type> <label> [modelId]`,
+              `${EXT_NOTIFY} Usage: /subswitch use <vendor> <auth_type> <label> [modelId]`,
               "warning",
             );
           }
@@ -3950,7 +3952,7 @@ export default function (pi: ExtensionAPI): void {
         if (ctx.hasUI) {
           const replacement = cmd === "primary" ? "subscription" : "api";
           ctx.ui.notify(
-            `[${EXT}] '${cmd}' is deprecated; use '/subswitch ${replacement} ${vendor} ...'`,
+            `${EXT_NOTIFY} '${cmd}' is deprecated; use '/subswitch ${replacement} ${vendor} ...'`,
             "warning",
           );
         }
@@ -3969,7 +3971,7 @@ export default function (pi: ExtensionAPI): void {
         if (!vendor || (authType !== "oauth" && authType !== "api_key") || !oldLabel || !newLabel) {
           if (ctx.hasUI) {
             ctx.ui.notify(
-              `[${EXT}] Usage: /subswitch rename <vendor> <auth_type> <old_label> <new_label>`,
+              `${EXT_NOTIFY} Usage: /subswitch rename <vendor> <auth_type> <old_label> <new_label>`,
               "warning",
             );
           }
@@ -3981,7 +3983,7 @@ export default function (pi: ExtensionAPI): void {
         if (!ok) {
           if (ctx.hasUI) {
             ctx.ui.notify(
-              `[${EXT}] Route not found for rename (${vendor}/${authType}/${oldLabel})`,
+              `${EXT_NOTIFY} Route not found for rename (${vendor}/${authType}/${oldLabel})`,
               "warning",
             );
           }
@@ -3992,7 +3994,7 @@ export default function (pi: ExtensionAPI): void {
         const savePath = saveCurrentConfig(ctx);
         if (ctx.hasUI) {
           ctx.ui.notify(
-            `[${EXT}] Renamed route '${oldLabel}' -> '${newLabel}'. Saved to ${savePath}`,
+            `${EXT_NOTIFY} Renamed route '${oldLabel}' -> '${newLabel}'. Saved to ${savePath}`,
             "info",
           );
         }
@@ -4022,7 +4024,7 @@ export default function (pi: ExtensionAPI): void {
       }
 
       if (ctx.hasUI) {
-        ctx.ui.notify(`[${EXT}] Unknown command '${cmd}'. Try '/subswitch help'.`, "warning");
+        ctx.ui.notify(`${EXT_NOTIFY} Unknown command '${cmd}'. Try '/subswitch help'.`, "warning");
       }
       updateStatus(ctx);
     },
@@ -4149,7 +4151,7 @@ export default function (pi: ExtensionAPI): void {
     if (!nextEntry) {
       if (ctx.hasUI) {
         ctx.ui.notify(
-          `[${EXT}] ${routeDisplay(resolved.vendor, route)} hit ${triggerLabel}. No eligible fallback route. Next retry in ${formatRetryWindow(until)}.`,
+          `${EXT_NOTIFY} ${routeDisplay(resolved.vendor, route)} hit ${triggerLabel}. No eligible fallback route. Next retry in ${formatRetryWindow(until)}.`,
           "warning",
         );
       }
@@ -4160,7 +4162,7 @@ export default function (pi: ExtensionAPI): void {
 
     if (ctx.hasUI) {
       ctx.ui.notify(
-        `[${EXT}] ${routeDisplay(resolved.vendor, route)} hit ${triggerLabel}. Switching to ${routeDisplay(nextEntry.route_ref.vendor, nextEntry.route_ref.route)} (${nextEntry.model_id}).`,
+        `${EXT_NOTIFY} ${routeDisplay(resolved.vendor, route)} hit ${triggerLabel}. Switching to ${routeDisplay(nextEntry.route_ref.vendor, nextEntry.route_ref.route)} (${nextEntry.model_id}).`,
         "warning",
       );
     }
@@ -4193,7 +4195,7 @@ export default function (pi: ExtensionAPI): void {
           : [{ type: "text", text: lastPrompt.text }, ...lastPrompt.images];
 
       if (ctx.hasUI) {
-        ctx.ui.notify(`[${EXT}] Retrying your last prompt on the new route…`, "info");
+        ctx.ui.notify(`${EXT_NOTIFY} Retrying your last prompt on the new route…`, "info");
       }
 
       if (typeof ctx.isIdle === "function" && ctx.isIdle()) {
