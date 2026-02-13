@@ -206,6 +206,27 @@ interface RouteProbeResult {
   inconclusive?: boolean;
 }
 
+type RouteIneligibleReason =
+  | "cooldown"
+  | "model_unavailable"
+  | "missing_credentials"
+  | "context_too_large";
+
+interface ContextFitResult {
+  fits: boolean;
+  source_tokens?: number;
+  estimated_target_tokens?: number;
+  target_context_window?: number;
+  safe_target_budget?: number;
+  multiplier?: number;
+}
+
+interface FallbackSelectionResult {
+  entry?: EffectivePreferenceEntry;
+  context_blocked: number;
+  first_context_blocked?: EffectivePreferenceEntry;
+}
+
 const decode = (s: string): string => {
   try {
     return decodeURIComponent(s);
@@ -989,9 +1010,18 @@ export default function (pi: ExtensionAPI): void {
   // Ensure we do not run concurrent preferred-route probes.
   let promotionProbeInFlight = false;
 
+  // Ensure we do not run concurrent switch-triggered compactions.
+  let switchCompactionInFlight = false;
+
   const RETURN_PROBE_TIMEOUT_MS = 12_000;
   const RETURN_PROBE_MIN_COOLDOWN_MS = 2 * 60_000;
   const RETURN_PROBE_MAX_COOLDOWN_MS = 10 * 60_000;
+
+  const SWITCH_CONTEXT_SAME_PROVIDER_MULTIPLIER = 1.08;
+  const SWITCH_CONTEXT_CROSS_PROVIDER_MULTIPLIER = 1.2;
+  const SWITCH_CONTEXT_RESERVE_RATIO = 0.15;
+  const SWITCH_CONTEXT_RESERVE_MIN_TOKENS = 16_384;
+  const SWITCH_COMPACTION_TIMEOUT_MS = 120_000;
 
   function now(): number {
     return Date.now();
@@ -1070,6 +1100,7 @@ export default function (pi: ExtensionAPI): void {
     if (rawState === "waiting_for_current_model") return "waiting for current /model";
     if (rawState === "model_unavailable") return "model unavailable";
     if (rawState === "missing_credentials") return "credentials needed";
+    if (rawState === "context_too_large") return "context too large for target model";
 
     if (rawState.startsWith("cooldown")) {
       if (cooldownUntilMs && cooldownUntilMs > now()) {
@@ -1374,17 +1405,182 @@ export default function (pi: ExtensionAPI): void {
     return Boolean(resolveApiKey(route));
   }
 
-  function routeEligible(ctx: any, vendor: string, index: number, modelId: string): boolean {
+  function contextFitForRouteModel(
+    ctx: any,
+    route: NormalizedRoute,
+    modelId: string,
+  ): ContextFitResult {
+    const targetModel = ctx.modelRegistry.find(route.provider_id, modelId);
+    if (!targetModel) return { fits: true };
+
+    const targetWindow = Number((targetModel as any).contextWindow ?? 0);
+    if (!Number.isFinite(targetWindow) || targetWindow <= 0) {
+      return { fits: true };
+    }
+
+    const usage = typeof ctx.getContextUsage === "function"
+      ? ctx.getContextUsage()
+      : undefined;
+    const sourceTokens = Number(usage?.tokens ?? 0);
+    if (!Number.isFinite(sourceTokens) || sourceTokens <= 0) {
+      return { fits: true, target_context_window: targetWindow };
+    }
+
+    const currentProvider = String(ctx.model?.provider ?? "").trim();
+    const multiplier =
+      currentProvider && currentProvider === route.provider_id
+        ? SWITCH_CONTEXT_SAME_PROVIDER_MULTIPLIER
+        : SWITCH_CONTEXT_CROSS_PROVIDER_MULTIPLIER;
+
+    const estimatedTokens = Math.ceil(sourceTokens * multiplier);
+    const reserveTokens = Math.max(
+      SWITCH_CONTEXT_RESERVE_MIN_TOKENS,
+      Math.floor(targetWindow * SWITCH_CONTEXT_RESERVE_RATIO),
+    );
+    const safeBudget = Math.max(1024, targetWindow - reserveTokens);
+
+    return {
+      fits: estimatedTokens <= safeBudget,
+      source_tokens: sourceTokens,
+      estimated_target_tokens: estimatedTokens,
+      target_context_window: targetWindow,
+      safe_target_budget: safeBudget,
+      multiplier,
+    };
+  }
+
+  function routeIneligibleReason(
+    ctx: any,
+    vendor: string,
+    index: number,
+    modelId: string,
+  ): RouteIneligibleReason | undefined {
     const route = getRoute(vendor, index);
-    if (!route) return false;
-    if (isRouteCoolingDown(vendor, index)) return false;
-    if (!routeCanHandleModel(ctx, route, modelId)) return false;
-    if (!routeHasUsableCredentials(vendor, route)) return false;
-    return true;
+    if (!route) return "model_unavailable";
+    if (isRouteCoolingDown(vendor, index)) return "cooldown";
+    if (!routeCanHandleModel(ctx, route, modelId)) return "model_unavailable";
+    if (!routeHasUsableCredentials(vendor, route)) return "missing_credentials";
+
+    const fit = contextFitForRouteModel(ctx, route, modelId);
+    if (!fit.fits) return "context_too_large";
+
+    return undefined;
+  }
+
+  function routeEligible(ctx: any, vendor: string, index: number, modelId: string): boolean {
+    return routeIneligibleReason(ctx, vendor, index, modelId) === undefined;
   }
 
   function routeEligibleRef(ctx: any, ref: ResolvedRouteRef, modelId: string): boolean {
     return routeEligible(ctx, ref.vendor, ref.index, modelId);
+  }
+
+  function findNextEligibleFallback(
+    ctx: any,
+    effective: EffectivePreferenceEntry[],
+    start: number,
+  ): FallbackSelectionResult {
+    let contextBlocked = 0;
+    let firstContextBlocked: EffectivePreferenceEntry | undefined;
+
+    for (let i = start; i < effective.length; i++) {
+      const candidate = effective[i];
+      const reason = routeIneligibleReason(
+        ctx,
+        candidate.route_ref.vendor,
+        candidate.route_ref.index,
+        candidate.model_id,
+      );
+
+      if (!reason) {
+        return {
+          entry: candidate,
+          context_blocked: contextBlocked,
+          first_context_blocked: firstContextBlocked,
+        };
+      }
+
+      if (reason === "context_too_large") {
+        contextBlocked += 1;
+        if (!firstContextBlocked) firstContextBlocked = candidate;
+      }
+    }
+
+    return {
+      context_blocked: contextBlocked,
+      first_context_blocked: firstContextBlocked,
+    };
+  }
+
+  function contextFitSummary(fit: ContextFitResult): string {
+    const source = Number(fit.source_tokens ?? 0).toLocaleString();
+    const estimate = Number(fit.estimated_target_tokens ?? 0).toLocaleString();
+    const budget = Number(fit.safe_target_budget ?? 0).toLocaleString();
+    const window = Number(fit.target_context_window ?? 0).toLocaleString();
+
+    return `current ~${source} tokens (estimated ~${estimate} on target) exceeds safe budget ~${budget}/${window}`;
+  }
+
+  async function runSwitchCompaction(
+    ctx: any,
+    targetRoute: NormalizedRoute,
+    targetModelId: string,
+  ): Promise<{ ok: boolean; message?: string }> {
+    if (switchCompactionInFlight) {
+      return { ok: false, message: "compaction already in progress" };
+    }
+
+    if (typeof ctx.compact !== "function") {
+      return { ok: false, message: "compaction is unavailable in this runtime" };
+    }
+
+    if (typeof ctx.isIdle === "function" && !ctx.isIdle()) {
+      return { ok: false, message: "agent is busy; try again when idle" };
+    }
+
+    switchCompactionInFlight = true;
+
+    try {
+      return await new Promise((resolve) => {
+        let settled = false;
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+
+        const finish = (result: { ok: boolean; message?: string }) => {
+          if (settled) return;
+          settled = true;
+          if (timeout) clearTimeout(timeout);
+          resolve(result);
+        };
+
+        timeout = setTimeout(() => {
+          finish({
+            ok: false,
+            message: `compaction timed out after ${Math.floor(SWITCH_COMPACTION_TIMEOUT_MS / 1000)}s`,
+          });
+        }, SWITCH_COMPACTION_TIMEOUT_MS);
+
+        try {
+          ctx.compact({
+            customInstructions:
+              `Create a compact continuation summary so the conversation can continue after switching to ${targetRoute.provider_id}/${targetModelId}. Preserve unresolved tasks, constraints, key decisions, active file paths, and the latest user intent.`,
+            onComplete: () => finish({ ok: true }),
+            onError: (error: Error) => {
+              const msg = trimProbeMessage(
+                error instanceof Error ? error.message : String(error),
+              );
+              finish({ ok: false, message: msg });
+            },
+          });
+        } catch (error) {
+          const msg = trimProbeMessage(
+            error instanceof Error ? error.message : String(error),
+          );
+          finish({ ok: false, message: msg });
+        }
+      });
+    } finally {
+      switchCompactionInFlight = false;
+    }
   }
 
   function buildEffectivePreferenceStack(
@@ -2143,7 +2339,11 @@ export default function (pi: ExtensionAPI): void {
     let stateDisplay = stateText;
     if (stateText === "ready") {
       stateDisplay = ctx.ui.theme.fg("success", stateText);
-    } else if (stateText.startsWith("cooling down") || stateText === "waiting for current /model") {
+    } else if (
+      stateText.startsWith("cooling down") ||
+      stateText === "waiting for current /model" ||
+      stateText === "context too large for target model"
+    ) {
       stateDisplay = ctx.ui.theme.fg("warning", stateText);
     } else if (stateText === "model unavailable" || stateText === "credentials needed") {
       stateDisplay = ctx.ui.theme.fg("error", stateText);
@@ -2179,7 +2379,11 @@ export default function (pi: ExtensionAPI): void {
     const paintState = (state: string, cooldownUntilMs?: number): string => {
       const text = humanReadableRouteState(state, cooldownUntilMs);
       if (text === "ready") return paint("success", text);
-      if (text.startsWith("cooling down") || text === "waiting for current /model") {
+      if (
+        text.startsWith("cooling down") ||
+        text === "waiting for current /model" ||
+        text === "context too large for target model"
+      ) {
         return paint("warning", text);
       }
       if (text === "model unavailable" || text === "credentials needed") {
@@ -2247,6 +2451,8 @@ export default function (pi: ExtensionAPI): void {
         state = "model_unavailable";
       } else if (!routeHasUsableCredentials(ref.vendor, ref.route)) {
         state = "missing_credentials";
+      } else if (!isActive && !contextFitForRouteModel(ctx, ref.route, modelId).fits) {
+        state = "context_too_large";
       }
 
       const activeMark = isActive ? paint("success", "*") : " ";
@@ -2442,6 +2648,46 @@ export default function (pi: ExtensionAPI): void {
         );
       }
       return false;
+    }
+
+    let fit = contextFitForRouteModel(ctx, route, modelId);
+    if (!fit.fits) {
+      if (notify && ctx.hasUI) {
+        ctx.ui.notify(
+          `${EXT_NOTIFY} Cannot switch yet to ${routeDisplay(vendor, route)} (${modelId}): ${contextFitSummary(fit)}. Compacting current session first…`,
+          "warning",
+        );
+      }
+
+      const compactResult = await runSwitchCompaction(ctx, route, modelId);
+      if (!compactResult.ok) {
+        if (notify && ctx.hasUI) {
+          const reasonText = compactResult.message ? ` Reason: ${compactResult.message}` : "";
+          ctx.ui.notify(
+            `${EXT_NOTIFY} Could not compact session before switching to ${routeDisplay(vendor, route)}.${reasonText}`,
+            "warning",
+          );
+        }
+        return false;
+      }
+
+      fit = contextFitForRouteModel(ctx, route, modelId);
+      if (!fit.fits) {
+        if (notify && ctx.hasUI) {
+          ctx.ui.notify(
+            `${EXT_NOTIFY} Still cannot switch to ${routeDisplay(vendor, route)} (${modelId}) after compaction: ${contextFitSummary(fit)}.`,
+            "warning",
+          );
+        }
+        return false;
+      }
+
+      if (notify && ctx.hasUI) {
+        ctx.ui.notify(
+          `${EXT_NOTIFY} Compaction complete. Retrying switch to ${routeDisplay(vendor, route)} (${modelId}).`,
+          "info",
+        );
+      }
     }
 
     pendingExtensionSwitch = { provider: route.provider_id, modelId };
@@ -4139,25 +4385,45 @@ export default function (pi: ExtensionAPI): void {
     const currentIdx = findCurrentEffectiveStackIndex(effective, route.id, modelId);
     const start = currentIdx === undefined ? 0 : currentIdx + 1;
 
-    let nextEntry: EffectivePreferenceEntry | undefined;
-    for (let i = start; i < effective.length; i++) {
-      const candidate = effective[i];
-      if (routeEligibleRef(ctx, candidate.route_ref, candidate.model_id)) {
-        nextEntry = candidate;
-        break;
-      }
-    }
-
     const triggerLabel = triggeredByAuth
       ? "auth error"
       : triggeredByQuota
         ? "quota exhausted"
         : "rate limited";
 
-    if (!nextEntry) {
+    let selection = findNextEligibleFallback(ctx, effective, start);
+    let nextEntry = selection.entry;
+
+    if (!nextEntry && selection.context_blocked > 0) {
       if (ctx.hasUI) {
         ctx.ui.notify(
-          `${EXT_NOTIFY} ${routeDisplay(resolved.vendor, route)} hit ${triggerLabel}. No eligible fallback route. Next retry in ${formatRetryWindow(until)}.`,
+          `${EXT_NOTIFY} ${selection.context_blocked} fallback route(s) are currently blocked by context size. Trying compaction before failover…`,
+          "warning",
+        );
+      }
+
+      const compactTargetRoute = selection.first_context_blocked?.route_ref.route ?? route;
+      const compactTargetModel = selection.first_context_blocked?.model_id ?? modelId;
+      const compactResult = await runSwitchCompaction(ctx, compactTargetRoute, compactTargetModel);
+      if (!compactResult.ok && ctx.hasUI) {
+        const reasonText = compactResult.message ? ` Reason: ${compactResult.message}` : "";
+        ctx.ui.notify(
+          `${EXT_NOTIFY} Could not compact session before fallback retry.${reasonText}`,
+          "warning",
+        );
+      }
+
+      selection = findNextEligibleFallback(ctx, effective, start);
+      nextEntry = selection.entry;
+    }
+
+    if (!nextEntry) {
+      if (ctx.hasUI) {
+        const contextHint = selection.context_blocked > 0
+          ? ` ${selection.context_blocked} route(s) are blocked by context size.`
+          : "";
+        ctx.ui.notify(
+          `${EXT_NOTIFY} ${routeDisplay(resolved.vendor, route)} hit ${triggerLabel}. No eligible fallback route.${contextHint} Next retry in ${formatRetryWindow(until)}.`,
           "warning",
         );
       }

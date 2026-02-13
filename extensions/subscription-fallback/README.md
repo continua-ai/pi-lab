@@ -10,6 +10,7 @@ It supports:
 - configurable failover triggers (`rate_limit`, `quota_exhausted`, `auth_error`)
 - automatic return to preferred routes after cooldown/holdoff
 - pre-return route probing (stay on fallback if probe fails)
+- context-window-aware switching (skip over-small routes; compact before retry when useful)
 - persisted runtime state (cooldowns + return holdoff)
 - LLM-callable bridge tool: `subswitch_manage`
 
@@ -65,8 +66,11 @@ If triggered:
    - Uses provider retry hints when available.
    - Otherwise uses configured cooldown minutes for route/vendor.
 2. It selects the next eligible lower-priority entry in `preference_stack`.
-3. It switches to that route/model.
-4. After any automatic failover switch, if vendor `auto_retry=true`, it resends the previous user prompt (immediate if idle, otherwise queued as follow-up).
+   - Eligibility includes cooldown, model compatibility, credentials, and context-window fit.
+3. If routes are blocked by context size, it attempts compaction on the current route and retries selection.
+4. It switches to the selected route/model.
+   - If a direct switch is still context-blocked, it attempts compaction before retrying the switch.
+5. After any automatic failover switch, if vendor `auto_retry=true`, it resends the previous user prompt (immediate if idle, otherwise queued as follow-up).
 
 ### Return-to-preferred behavior
 
@@ -245,5 +249,5 @@ Keep provider ids stable to avoid unnecessary re-login.
 - If a stack entry omits `model`, it follows current `/model`.
 - `failover.scope=current_vendor` restricts failover/return to current vendor.
 - Context-window errors are ignored for failover triggering.
-- In interactive UI, status is color-coded (auth type + route state), including `ready` (green), cooldown/waiting (yellow), and unavailable/credentials-needed (red).
+- In interactive UI, status is color-coded (auth type + route state), including `ready` (green), cooldown/waiting/context-too-large (yellow), and unavailable/credentials-needed (red).
 - Retry/holdoff windows in status + notifications are formatted as human-readable durations with local-time "until" timestamps.
