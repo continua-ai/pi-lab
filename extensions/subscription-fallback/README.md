@@ -1,18 +1,40 @@
 # subscription-fallback (pi extension)
 
-`/subswitch` is a vendor/account failover manager for pi.
+`/subswitch` is a vendor/account/model failover manager for pi.
 
-It supports:
+It is designed to keep conversations moving when a route is rate-limited,
+quota-limited, or otherwise unavailable, while preserving predictable routing
+policy and clear user-facing status.
 
-- multiple vendors (currently `openai`, `claude`)
-- multiple auth routes per vendor (`oauth`, `api_key`)
-- global preference-stack failover (`route_id` + optional model override)
-- configurable failover triggers (`rate_limit`, `quota_exhausted`, `auth_error`)
-- automatic return to preferred routes after cooldown/holdoff
-- pre-return route probing (stay on fallback if probe fails)
-- context-window-aware switching (skip over-small routes; compact before retry when useful)
-- persisted runtime state (cooldowns + return holdoff)
-- LLM-callable bridge tool: `subswitch_manage`
+## What it does (full feature list)
+
+- Multi-vendor routing (currently `openai`, `claude`/`anthropic`).
+- Multiple routes per vendor (`oauth`, `api_key`).
+- Global preference stack failover by stable `route_id` (+ optional model override).
+- Configurable failover triggers:
+  - `rate_limit`
+  - `quota_exhausted`
+  - `auth_error` (API-key routes only)
+- Return-to-preferred logic with holdoff and background health checks.
+- Pre-return probing with safe handling:
+  - probe success -> switch back
+  - probe inconclusive (timeout/abort) -> attempt direct switch anyway
+  - probe failure -> stay on fallback and retry later
+- Context-window-aware switching:
+  - marks over-small routes ineligible for current context
+  - attempts compaction before retrying context-blocked switches
+  - does this for both manual switch and automatic failover selection
+- Automatic retry of the last prompt after successful automatic failover when
+  `auto_retry=true` for that vendor.
+- Persisted runtime state across reloads/restarts:
+  - per-route cooldowns
+  - return holdoff (`next_return_eligible_at_ms`)
+- Concise + detailed status surfaces with colorized state.
+- Guided setup wizard (apply-on-finish; cancel leaves existing config unchanged).
+- OAuth login reminder widget + `/subswitch login` flow.
+- LLM-callable tool bridge: `subswitch_manage`.
+
+---
 
 ## Install / update
 
@@ -39,62 +61,125 @@ cp extensions/subscription-fallback/index.ts ~/.pi/agent/extensions/subscription
 
 Then run `/reload`.
 
+---
+
+## Core concepts
+
+### Route
+
+A route is an account/auth lane for a vendor.
+
+- `auth_type: oauth` routes use pi OAuth credentials for `provider_id`.
+- `auth_type: api_key` routes use API key material from env/path/inline config.
+
+### `provider_id` vs route `id`
+
+- `provider_id`: runtime model provider alias used by pi model registry.
+- route `id`: stable policy identity used in `preference_stack` and persisted state.
+
+Keep route `id` stable so cooldown/holdoff state remains consistent.
+
+### Preference stack
+
+`preference_stack` defines strict failover order.
+Each entry references a route by `route_id` and can optionally pin `model`.
+If `model` is omitted, subswitch follows current `/model`.
+
+---
+
 ## Quick setup (recommended)
 
 1. Run `/subswitch setup`.
-2. Choose config destination (global/project).
-3. Configure vendors/routes/order/policy/preference stack.
-4. Finish setup (writes config atomically at end).
-5. Run `/subswitch login` and complete OAuth login(s) via `/login`.
-6. Ensure API-key env vars are set for `api_key` routes.
-7. Verify:
+2. Choose config destination (global or project).
+3. Configure vendors and route labels.
+4. Set failover policy options.
+5. Review/reorder preference stack.
+6. Finish setup (writes config atomically only at the end).
+7. Run `/subswitch login` and complete OAuth login(s) via `/login`.
+8. Ensure API-key env vars exist for `api_key` routes.
+9. Verify:
    - `/subswitch login-status`
    - `/subswitch status`
    - `/subswitch longstatus`
 
+Wizard behavior notes:
+
+- Back navigation is supported across screens.
+- `Continue` is first in toggle menus for Enter-safe progression.
+- Route IDs are preserved where possible when editing existing vendor routes.
+
+---
+
 ## How failover works
 
-When a turn ends with an error, subswitch evaluates configured triggers:
-
-- `rate_limit`
-- `quota_exhausted`
-- `auth_error` (API-key routes only)
+When a turn ends with an error, subswitch evaluates configured triggers.
 
 If triggered:
 
-1. It places the current route on cooldown.
+1. Current route is placed on cooldown.
    - Uses provider retry hints when available.
-   - Otherwise uses configured cooldown minutes for route/vendor.
-2. It selects the next eligible lower-priority entry in `preference_stack`.
-   - Eligibility includes cooldown, model compatibility, credentials, and context-window fit.
-3. If routes are blocked by context size, it attempts compaction on the current route and retries selection.
+   - Otherwise uses configured cooldown for route/vendor.
+2. It selects the next eligible lower-priority stack entry.
+3. If candidates are blocked by context size, it compacts current session and retries selection.
 4. It switches to the selected route/model.
-   - If a direct switch is still context-blocked, it attempts compaction before retrying the switch.
-5. After any automatic failover switch, if vendor `auto_retry=true`, it resends the previous user prompt (immediate if idle, otherwise queued as follow-up).
+5. If `auto_retry=true` for current vendor, it re-sends last prompt automatically.
 
-### Return-to-preferred behavior
+### Eligibility checks for candidate routes
 
-If `failover.return_to_preferred.enabled=true`, subswitch can move back up the stack after `min_stable_minutes` holdoff.
+A route is eligible only if all are true:
 
-Before switching upward, it performs a lightweight probe on the candidate route/model.
-The probe runs as an idle/background check and is not awaited on user prompt start.
+- not cooling down
+- model is available on route provider
+- credentials are usable
+- context fits target model window (conservative fit estimate)
 
-- Probe success: switch back to preferred route.
-- Probe inconclusive (for example, timeout/abort): attempt a direct switch anyway; if that fails, stay on current route, set a short cooldown, retry later.
-- Probe failure: stay on current route, set a short cooldown on the preferred candidate, retry later.
+### Context-window-aware behavior
 
-User-facing notifications explicitly call this out (health check, stay-on-fallback, retry window).
+Subswitch estimates whether current context can fit target model safely.
+If not, it will:
 
-## Config + state paths
+- mark route as context-blocked (`context too large for target model`)
+- attempt compaction before retrying selection/switch
+- emit explicit user messaging about context block and retry plan
+
+> Current implementation uses runtime model metadata (`contextWindow`) and
+> conservative heuristics. Account-tier-specific limits not exposed by runtime
+> metadata may still differ.
+
+---
+
+## Return-to-preferred behavior
+
+If `failover.return_to_preferred.enabled=true`, subswitch can return upward in
+preference stack after `min_stable_minutes` holdoff.
+
+Return checks run in idle/background paths (not awaited on prompt start).
+
+Flow:
+
+1. Wait until holdoff expires.
+2. Probe preferred candidate route/model.
+3. Outcomes:
+   - success: switch to preferred route
+   - inconclusive probe (timeout/abort): attempt direct switch anyway
+   - failure: stay on fallback, set short cooldown, retry later
+
+Notifications are phrased to distinguish normal inconclusive recovery vs hard
+failure, and include next-check timing.
+
+---
+
+## Runtime state + file locations
 
 ### Config merge order
 
 1. Global: `~/.pi/agent/subswitch.json`
 2. Project: `./.pi/subswitch.json`
 
-Project values override top-level global keys. Vendor lists are merged by vendor name.
+Project overrides top-level global keys. Vendor lists merge by vendor name.
 
-If no `subswitch.json` exists, subswitch attempts runtime migration from legacy `subscription-fallback.json` shape.
+If no `subswitch.json` exists, subswitch attempts runtime migration from legacy
+`subscription-fallback.json` shape.
 
 ### Runtime state files
 
@@ -103,12 +188,88 @@ State includes route cooldowns + return holdoff:
 - Global: `~/.pi/agent/subswitch-state.json`
 - Project: `./.pi/subswitch-state.json`
 
-State is keyed by route `id` and survives `/reload` and session restarts.
+State keying is based on route `id`.
 
-### Reload commands
+### Reload semantics
 
-- `/subswitch reload` -> reloads config + runtime state from disk.
-- `/reload` -> reloads extension code/resources (full extension runtime reload).
+- `/subswitch reload` -> reload config + runtime state from disk.
+- `/reload` -> reload extension code/resources (full runtime reload).
+
+State is loaded on session start/switch and on `/subswitch reload`.
+State is persisted on session shutdown and when cooldown/holdoff values change.
+
+---
+
+## Commands
+
+All control is via `/subswitch`.
+
+### Primary commands
+
+- `/subswitch`
+  - Quick picker + status.
+- `/subswitch status`
+  - Concise, stack-first status.
+- `/subswitch longstatus`
+  - Detailed status (models, provider IDs, route IDs, per-vendor route view).
+- `/subswitch help`
+  - Print command help.
+- `/subswitch setup`
+  - Guided setup wizard.
+- `/subswitch login`
+  - OAuth login checklist + optional `/login` prefill.
+- `/subswitch login-status`
+  - Re-check OAuth completion and update reminder widget.
+- `/subswitch reload`
+  - Reload config + runtime state.
+- `/subswitch on` / `/subswitch off`
+  - Runtime enable/disable for current session.
+
+### Route selection commands
+
+- `/subswitch use <vendor> <auth_type> <label> [modelId]`
+  - Force a specific route.
+- `/subswitch subscription <vendor> [label] [modelId]`
+  - Use OAuth route.
+- `/subswitch api <vendor> [label] [modelId]`
+  - Use API-key route.
+
+### Config editing commands
+
+- `/subswitch rename <vendor> <auth_type> <old_label> <new_label>`
+- `/subswitch reorder [vendor]`
+- `/subswitch edit`
+- `/subswitch models <vendor>`
+
+### Compatibility aliases
+
+- `/subswitch primary ...` -> `subscription` (deprecated)
+- `/subswitch fallback ...` -> `api` (deprecated)
+
+---
+
+## LLM tool bridge
+
+Tool name: `subswitch_manage`
+
+Supported actions:
+
+- `status`
+- `longstatus`
+- `reload`
+- `use`
+- `prefer`
+- `rename`
+
+Parameters:
+
+- `vendor`
+- `auth_type` (`oauth` | `api_key`)
+- `label`
+- `model_id` (optional)
+- `old_label` / `new_label` (rename)
+
+---
 
 ## Config schema (v2)
 
@@ -176,78 +337,38 @@ State is keyed by route `id` and survives `/reload` and session restarts.
 }
 ```
 
-## Commands
-
-All control is via `/subswitch`.
-
-- `/subswitch`
-  - Quick picker + status.
-- `/subswitch status`
-  - Concise status (stack-first).
-- `/subswitch longstatus`
-  - Detailed status (stack/models/ids/providers).
-- `/subswitch setup`
-  - Guided setup wizard (Back supported, apply-on-finish).
-- `/subswitch login`
-  - OAuth login checklist + optional `/login` prefill.
-- `/subswitch login-status`
-  - Re-check OAuth completion + update reminder widget.
-- `/subswitch reload`
-  - Reload config + runtime state.
-- `/subswitch on` / `/subswitch off`
-  - Runtime enable/disable (current session only).
-- `/subswitch use <vendor> <auth_type> <label> [modelId]`
-  - Force a specific route.
-- `/subswitch subscription <vendor> [label] [modelId]`
-  - Use OAuth route (first eligible if no label).
-- `/subswitch api <vendor> [label] [modelId]`
-  - Use API-key route (first eligible if no label).
-- `/subswitch rename <vendor> <auth_type> <old_label> <new_label>`
-  - Rename route label and persist config.
-- `/subswitch reorder [vendor]`
-  - Interactive preference-stack reorder, persists config.
-- `/subswitch edit`
-  - Edit JSON config with validation.
-- `/subswitch models <vendor>`
-  - Show compatible models across routes for vendor.
-
-Compatibility aliases:
-
-- `/subswitch primary ...` -> `subscription` (deprecated)
-- `/subswitch fallback ...` -> `api` (deprecated)
-
-## LLM tool bridge
-
-Registered tool: `subswitch_manage`
-
-Supported actions:
-
-- `status`
-- `longstatus`
-- `reload`
-- `use`
-- `prefer`
-- `rename`
-
-This allows natural language control via tool calls.
+---
 
 ## Provider aliases
 
 Built-ins include `openai`, `openai-codex`, and `anthropic`.
-Subswitch can register aliases such as:
+Subswitch auto-registers alias providers referenced by route `provider_id`
+(e.g. `openai-codex-work`, `anthropic-work`, custom API aliases).
 
-- `openai-codex-work`
-- `my-codex-work`
-- `anthropic-work`
-- `anthropic-api`
+OAuth credentials are stored per provider ID in `~/.pi/agent/auth.json`.
+Keep provider IDs stable to avoid unnecessary re-login.
 
-OAuth credentials are stored per provider id in `~/.pi/agent/auth.json`.
-Keep provider ids stable to avoid unnecessary re-login.
+---
 
-## Notes
+## Status semantics
 
-- If a stack entry omits `model`, it follows current `/model`.
+Interactive status/stack coloring:
+
+- `ready` -> green
+- `cooldown` / `waiting for current /model` / `context too large` -> yellow
+- `model unavailable` / `credentials needed` -> red
+
+Time windows are reported as human-readable durations plus local
+`until ...` timestamps.
+
+---
+
+## Notes and limitations
+
+- Context-window errors are intentionally excluded from failover trigger
+  classification; context fit is handled by eligibility + compaction paths.
 - `failover.scope=current_vendor` restricts failover/return to current vendor.
-- Context-window errors are ignored for failover triggering.
-- In interactive UI, status is color-coded (auth type + route state), including `ready` (green), cooldown/waiting/context-too-large (yellow), and unavailable/credentials-needed (red).
-- Retry/holdoff windows in status + notifications are formatted as human-readable durations with local-time "until" timestamps.
+- `off` disables runtime behavior without rewriting config.
+- Extremely large histories where no route can compact currently remain in
+  stay-and-retry mode; continuation/map-reduce fallback is documented in:
+  `context-window-failover-design.md`.
