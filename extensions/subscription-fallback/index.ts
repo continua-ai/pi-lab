@@ -1783,8 +1783,8 @@ export default function (pi: ExtensionAPI): void {
         if (ctx.hasUI) {
           const detail = probe.message ? ` (${probe.message})` : "";
           ctx.ui.notify(
-            `[${EXT}] Preferred route probe was inconclusive${detail}. Attempting direct switch to ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})…`,
-            "warning",
+            `[${EXT}] Preferred route check was inconclusive${detail}. Trying a direct switch to ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})…`,
+            "info",
           );
         }
 
@@ -1794,9 +1794,15 @@ export default function (pi: ExtensionAPI): void {
           target.route_ref.index,
           target.model_id,
           `${reason} (probe inconclusive)`,
-          true,
+          false,
         );
         if (switchedAfterInconclusiveProbe) {
+          if (ctx.hasUI) {
+            ctx.ui.notify(
+              `[${EXT}] Switched back to preferred route: ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id}).`,
+              "info",
+            );
+          }
           return;
         }
       }
@@ -1810,14 +1816,19 @@ export default function (pi: ExtensionAPI): void {
       setRouteCooldownUntil(target.route_ref.vendor, target.route_ref.index, cooldownUntil);
 
       if (ctx.hasUI) {
-        const prefix = probe.inconclusive
-          ? " Probe was inconclusive and direct switch failed."
-          : "";
-        const reasonText = probe.message ? ` Reason: ${probe.message}` : "";
-        ctx.ui.notify(
-          `[${EXT}] Preferred route still unavailable. Staying on ${routeDisplay(resolved.vendor, currentRoute)}. Next check in ${formatRetryWindow(cooldownUntil)}.${prefix}${reasonText}`,
-          "warning",
-        );
+        if (probe.inconclusive) {
+          const reasonText = probe.message ? ` Last check: ${probe.message}.` : "";
+          ctx.ui.notify(
+            `[${EXT}] Stayed on ${routeDisplay(resolved.vendor, currentRoute)} for now. Preferred route check was inconclusive and direct switch did not succeed. Next check in ${formatRetryWindow(cooldownUntil)}.${reasonText}`,
+            "info",
+          );
+        } else {
+          const reasonText = probe.message ? ` Reason: ${probe.message}` : "";
+          ctx.ui.notify(
+            `[${EXT}] Preferred route still unavailable. Staying on ${routeDisplay(resolved.vendor, currentRoute)}. Next check in ${formatRetryWindow(cooldownUntil)}.${reasonText}`,
+            "warning",
+          );
+        }
       }
 
       scheduleRetryTimer(ctx);
