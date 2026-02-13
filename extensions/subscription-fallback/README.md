@@ -76,6 +76,7 @@ Before switching upward, it performs a lightweight probe on the candidate route/
 The probe runs as an idle/background check and is not awaited on user prompt start.
 
 - Probe success: switch back to preferred route.
+- Probe inconclusive (for example, timeout/abort): attempt a direct switch anyway; if that fails, stay on current route, set a short cooldown, retry later.
 - Probe failure: stay on current route, set a short cooldown on the preferred candidate, retry later.
 
 User-facing notifications explicitly call this out (health check, stay-on-fallback, retry window).

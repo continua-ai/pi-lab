@@ -201,6 +201,7 @@ interface RouteProbeResult {
   ok: boolean;
   message?: string;
   retry_after_ms?: number;
+  inconclusive?: boolean;
 }
 
 const decode = (s: string): string => {
@@ -1486,6 +1487,31 @@ export default function (pi: ExtensionAPI): void {
     return `${oneLine.slice(0, 177)}...`;
   }
 
+  function classifyProbeException(error: unknown): { message: string; inconclusive: boolean } {
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    let message = trimProbeMessage(rawMessage);
+
+    const lower = message.toLowerCase();
+    const errorName = error instanceof Error ? error.name.toLowerCase() : "";
+
+    const inconclusive =
+      errorName === "aborterror" ||
+      lower.includes("operation was aborted") ||
+      lower.includes("request was aborted") ||
+      lower.includes("timeout") ||
+      lower.includes("timed out");
+
+    if (inconclusive && (
+      lower.includes("operation was aborted") ||
+      lower.includes("request was aborted") ||
+      lower.includes("abort")
+    )) {
+      message = `probe timed out after ${Math.floor(RETURN_PROBE_TIMEOUT_MS / 1000)}s`;
+    }
+
+    return { message, inconclusive };
+  }
+
   function applyOpenAIRouteHeaders(route: NormalizedRoute, headers: Headers): void {
     if (route.openai_org_id_env) {
       const org = process.env[route.openai_org_id_env];
@@ -1686,13 +1712,12 @@ export default function (pi: ExtensionAPI): void {
         retry_after_ms: parseRetryAfterMs(message),
       };
     } catch (error) {
-      const message = trimProbeMessage(
-        error instanceof Error ? error.message : String(error),
-      );
+      const classified = classifyProbeException(error);
       return {
         ok: false,
-        message,
-        retry_after_ms: parseRetryAfterMs(message),
+        message: classified.message,
+        retry_after_ms: parseRetryAfterMs(classified.message),
+        inconclusive: classified.inconclusive,
       };
     } finally {
       clearTimeout(timeout);
@@ -1754,6 +1779,28 @@ export default function (pi: ExtensionAPI): void {
 
     const probe = await probeRouteModel(ctx, target.route_ref, target.model_id);
     if (!probe.ok) {
+      if (probe.inconclusive) {
+        if (ctx.hasUI) {
+          const detail = probe.message ? ` (${probe.message})` : "";
+          ctx.ui.notify(
+            `[${EXT}] Preferred route probe was inconclusive${detail}. Attempting direct switch to ${routeDisplay(target.route_ref.vendor, target.route_ref.route)} (${target.model_id})…`,
+            "warning",
+          );
+        }
+
+        const switchedAfterInconclusiveProbe = await switchToRoute(
+          ctx,
+          target.route_ref.vendor,
+          target.route_ref.index,
+          target.model_id,
+          `${reason} (probe inconclusive)`,
+          true,
+        );
+        if (switchedAfterInconclusiveProbe) {
+          return;
+        }
+      }
+
       const cooldownMs = probeFailureCooldownMs(
         targetVendorCfg,
         target.route_ref.route,
@@ -1763,9 +1810,12 @@ export default function (pi: ExtensionAPI): void {
       setRouteCooldownUntil(target.route_ref.vendor, target.route_ref.index, cooldownUntil);
 
       if (ctx.hasUI) {
+        const prefix = probe.inconclusive
+          ? " Probe was inconclusive and direct switch failed."
+          : "";
         const reasonText = probe.message ? ` Reason: ${probe.message}` : "";
         ctx.ui.notify(
-          `[${EXT}] Preferred route still unavailable. Staying on ${routeDisplay(resolved.vendor, currentRoute)}. Next check in ${formatRetryWindow(cooldownUntil)}.${reasonText}`,
+          `[${EXT}] Preferred route still unavailable. Staying on ${routeDisplay(resolved.vendor, currentRoute)}. Next check in ${formatRetryWindow(cooldownUntil)}.${prefix}${reasonText}`,
           "warning",
         );
       }
