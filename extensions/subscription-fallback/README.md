@@ -42,6 +42,7 @@ policy and clear user-facing status.
 Related design docs in this directory:
 
 - `subswitch_functional_technical_design.md`
+- `subswitch_refactor_plan.md`
 - `context-window-failover-design.md`
 
 ---
