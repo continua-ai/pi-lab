@@ -39,6 +39,11 @@ policy and clear user-facing status.
   new-session recovery when in-session switching is insufficient.
 - LLM-callable tool bridge: `subswitch_manage`.
 
+Related design docs in this directory:
+
+- `subswitch_functional_technical_design.md`
+- `context-window-failover-design.md`
+
 ---
 
 ## Install / update

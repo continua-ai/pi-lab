@@ -1071,6 +1071,29 @@ export default function (pi: ExtensionAPI): void {
   const CONTINUATION_MAX_CHUNKS = 8;
   const CONTINUATION_MAX_LINES_PER_CHUNK = 60;
 
+  function parseDecisionEventLimit(raw: unknown): number {
+    const n = Number(raw ?? DECISION_EVENT_DEFAULT_LIMIT);
+    if (!Number.isFinite(n)) return DECISION_EVENT_DEFAULT_LIMIT;
+    return Math.max(1, Math.min(DECISION_EVENT_MAX, Math.floor(n)));
+  }
+
+  function hasExplicitContinuationSelector(
+    vendor?: string,
+    authType?: AuthType,
+    label?: string,
+    modelId?: string,
+  ): boolean {
+    return Boolean(vendor || authType || label || modelId);
+  }
+
+  function isCompleteContinuationSelector(
+    vendor?: string,
+    authType?: AuthType,
+    label?: string,
+  ): boolean {
+    return Boolean(vendor && authType && label);
+  }
+
   function now(): number {
     return Date.now();
   }
@@ -3709,43 +3732,56 @@ export default function (pi: ExtensionAPI): void {
     return cfg?.default_vendor ?? "openai";
   }
 
+  // Models compatible with every configured route for a vendor.
+  // Shared by `/subswitch models` and setup validation to keep behavior consistent.
+  function compatibleModelsAcrossVendorRoutes(ctx: any, vendor: string): string[] {
+    const vendorCfg = getVendor(vendor);
+    if (!vendorCfg) return [];
+
+    const available = (ctx.modelRegistry.getAvailable?.() ?? []) as any[];
+    const byProvider = new Map<string, Set<string>>();
+
+    for (const model of available) {
+      const providerId = String(model?.provider ?? "");
+      const modelId = String(model?.id ?? "");
+      if (!providerId || !modelId) continue;
+
+      if (!byProvider.has(providerId)) {
+        byProvider.set(providerId, new Set<string>());
+      }
+      byProvider.get(providerId)?.add(modelId);
+    }
+
+    let intersection: Set<string> | undefined;
+    for (const route of vendorCfg.routes) {
+      const ids = byProvider.get(route.provider_id) ?? new Set<string>();
+      if (!intersection) {
+        intersection = new Set(ids);
+        continue;
+      }
+
+      for (const id of Array.from(intersection)) {
+        if (!ids.has(id)) intersection.delete(id);
+      }
+    }
+
+    return Array.from(intersection ?? []).sort();
+  }
+
   async function showModelCompatibility(ctx: any, vendor: string): Promise<void> {
     ensureCfg(ctx);
 
-    const v = getVendor(vendor);
-    if (!v) {
+    const vendorCfg = getVendor(vendor);
+    if (!vendorCfg) {
       if (ctx.hasUI) ctx.ui.notify(`${EXT_NOTIFY} Unknown vendor '${vendor}'`, "warning");
       return;
     }
 
-    const available = ctx.modelRegistry.getAvailable() as any[];
-    const byProvider = new Map<string, Set<string>>();
-
-    for (const m of available) {
-      const p = String(m.provider ?? "");
-      const id = String(m.id ?? "");
-      if (!p || !id) continue;
-      if (!byProvider.has(p)) byProvider.set(p, new Set<string>());
-      byProvider.get(p)?.add(id);
-    }
-
-    let intersection: Set<string> | undefined;
-    for (const route of v.routes) {
-      const ids = byProvider.get(route.provider_id) ?? new Set<string>();
-      if (!intersection) {
-        intersection = new Set(ids);
-      } else {
-        for (const id of Array.from(intersection)) {
-          if (!ids.has(id)) intersection.delete(id);
-        }
-      }
-    }
-
-    const models = Array.from(intersection ?? []).sort();
+    const models = compatibleModelsAcrossVendorRoutes(ctx, vendor);
 
     if (ctx.hasUI) {
       ctx.ui.notify(
-        `${EXT_NOTIFY} Compatible models for vendor '${vendor}' across ${v.routes.length} routes: ${
+        `${EXT_NOTIFY} Compatible models for vendor '${vendor}' across ${vendorCfg.routes.length} routes: ${
           models.length > 0 ? models.join(", ") : "(none)"
         }`,
         models.length > 0 ? "info" : "warning",
@@ -4318,37 +4354,6 @@ export default function (pi: ExtensionAPI): void {
       }
     }
 
-    function compatibleModelsForVendor(vendor: string): string[] {
-      const v = getVendor(vendor);
-      if (!v) return [];
-
-      const available = (ctx.modelRegistry.getAvailable?.() ?? []) as any[];
-      const byProvider = new Map<string, Set<string>>();
-
-      for (const m of available) {
-        const p = String(m?.provider ?? "");
-        const id = String(m?.id ?? "");
-        if (!p || !id) continue;
-        if (!byProvider.has(p)) byProvider.set(p, new Set<string>());
-        byProvider.get(p)?.add(id);
-      }
-
-      let intersection: Set<string> | undefined;
-      for (const route of v.routes) {
-        const ids = byProvider.get(route.provider_id) ?? new Set<string>();
-        if (!intersection) {
-          intersection = new Set(ids);
-          continue;
-        }
-
-        for (const id of Array.from(intersection)) {
-          if (!ids.has(id)) intersection.delete(id);
-        }
-      }
-
-      return Array.from(intersection ?? []).sort();
-    }
-
     type SetupValidationResult = {
       lines: string[];
       missingOauth: string[];
@@ -4397,7 +4402,7 @@ export default function (pi: ExtensionAPI): void {
         }
       }
 
-      const compatibleModels = compatibleModelsForVendor(defaultVendor);
+      const compatibleModels = compatibleModelsAcrossVendorRoutes(ctx, defaultVendor);
 
       let contextBlocked: ResolvedPreferenceEntry | undefined;
       let contextBlockedCount = 0;
@@ -5068,10 +5073,7 @@ export default function (pi: ExtensionAPI): void {
       }
 
       if (action === "events") {
-        const nRaw = Number(params.limit ?? DECISION_EVENT_DEFAULT_LIMIT);
-        const limit = Number.isFinite(nRaw)
-          ? Math.max(1, Math.min(200, Math.floor(nRaw)))
-          : DECISION_EVENT_DEFAULT_LIMIT;
+        const limit = parseDecisionEventLimit(params.limit);
         const text = buildDecisionEventLines(limit).join("\n");
         return {
           content: [{ type: "text", text }],
@@ -5157,8 +5159,8 @@ export default function (pi: ExtensionAPI): void {
         const label = params.label ? String(params.label).trim() : undefined;
         const modelId = params.model_id ? String(params.model_id).trim() : undefined;
 
-        const hasExplicitSelector = Boolean(vendor || authType || label || modelId);
-        if (hasExplicitSelector && !(vendor && authType && label)) {
+        const explicitSelector = hasExplicitContinuationSelector(vendor, authType, label, modelId);
+        if (explicitSelector && !isCompleteContinuationSelector(vendor, authType, label)) {
           return {
             content: [
               {
@@ -5277,10 +5279,7 @@ export default function (pi: ExtensionAPI): void {
         } else if (cmd === "explain") {
           notifyExplain(ctx);
         } else {
-          const nRaw = Number(parts[1] ?? DECISION_EVENT_DEFAULT_LIMIT);
-          const limit = Number.isFinite(nRaw)
-            ? Math.max(1, Math.min(200, Math.floor(nRaw)))
-            : DECISION_EVENT_DEFAULT_LIMIT;
+          const limit = parseDecisionEventLimit(parts[1]);
           notifyEvents(ctx, limit);
         }
         await refreshOauthReminderWidget(ctx, configuredOauthProviders());
@@ -5508,8 +5507,8 @@ export default function (pi: ExtensionAPI): void {
           return;
         }
 
-        const hasExplicitSelector = Boolean(vendor || authType || label || modelId);
-        if (hasExplicitSelector && !(vendor && authType && label)) {
+        const explicitSelector = hasExplicitContinuationSelector(vendor, authType, label, modelId);
+        if (explicitSelector && !isCompleteContinuationSelector(vendor, authType, label)) {
           if (ctx.hasUI) {
             ctx.ui.notify(
               `${EXT_NOTIFY} Usage: /subswitch continue [vendor auth_type(oauth|api_key) label [modelId]]`,
