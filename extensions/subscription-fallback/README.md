@@ -392,6 +392,20 @@ Time windows are reported as human-readable durations plus local
 
 ---
 
+## Regression tests
+
+Subswitch regression coverage is checked in under:
+
+- `extensions/subscription-fallback/tests/subswitch_regression.test.mjs`
+
+Run locally:
+
+```bash
+npm run test:subswitch
+```
+
+CI runs the same test suite for PRs touching `extensions/subscription-fallback/**`.
+
 ## Notes and limitations
 
 - Context-window errors are intentionally excluded from failover trigger

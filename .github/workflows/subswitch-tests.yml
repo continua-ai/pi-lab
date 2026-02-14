@@ -1,0 +1,32 @@
+name: subswitch regression tests
+
+on:
+  pull_request:
+    paths:
+      - 'extensions/subscription-fallback/**'
+      - 'package.json'
+      - '.github/workflows/subswitch-tests.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'extensions/subscription-fallback/**'
+      - 'package.json'
+      - '.github/workflows/subswitch-tests.yml'
+
+jobs:
+  subswitch-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Run subswitch regression tests
+        run: npm run test:subswitch

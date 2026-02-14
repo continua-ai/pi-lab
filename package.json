@@ -5,6 +5,9 @@
   "license": "MIT",
   "keywords": ["pi-package"],
   "type": "module",
+  "scripts": {
+    "test:subswitch": "node --test extensions/subscription-fallback/tests/subswitch_regression.test.mjs"
+  },
   "pi": {
     "extensions": ["./extensions"]
   }
